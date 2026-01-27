@@ -9,14 +9,13 @@
    Muscle Balance:
      ✅ Clickable SVG (front + back) with 6-stage color scale
      ✅ Tap muscle → shows ONLY exercises for that muscle
-     ✅ Tap exercise → opens Exercise view (ALWAYS valid ExerciseID)
+     ✅ Tap exercise → opens Exercise view
 
    Exercise View:
-     ✅ Works even if exercise is NOT in Routine_Exercises (library-only)
-     ✅ Uses Exercise_Library.SchemeID for schemes
-     ✅ Uses User_Maxes TM/1RM for planned weights (PctTM)
-     ✅ Major lifts: save sets
-     ✅ Accessory done logging can be added next step
+     ✅ LOGGING WORKS FOR ALL EXERCISES (Major + Accessory + Library-only)
+     ✅ Uses Exercise_Library.SchemeID for scheme display
+     ✅ Uses User_Maxes TM/1RM for planned weights
+     ✅ Every set row has Save button
 
    Hard sets computed from Training_Log (boot.logs):
      Primary = 1.0, Secondary = 0.5
@@ -35,12 +34,26 @@ import "./App.css";
 import type { BootstrapResponse, RoutineExercise, RoutineSession } from "./types";
 import { authTest, fetchBootstrap, postLogSet, postUpdateOneRM } from "./api";
 import { buildIndexes, fmtWeight, isMajor, sortedSessionExercises, toNumber } from "./logic";
+import MuscleMap from "./components/MuscleMap";
+
 
 /* =========================================================
    ## TYPES ##
    ========================================================= */
-type View = "sessions" | "session" | "exercise" | "muscle_balance";
-type ExerciseBackTarget = "session" | "muscle_balance";
+// ==============================
+// FILE: src/App.tsx
+// SECTION: VIEW TYPES (REPLACE ALL)
+// ==============================
+// START VIEW TYPES REPLACEMENT
+
+type View = "sessions" | "muscle_balance" | "session" | "exercise";
+
+function normalizeView(v: any): View {
+  if (v === "sessions" || v === "muscle_balance" || v === "session" || v === "exercise") return v;
+  return "sessions";
+}
+
+// END VIEW TYPES REPLACEMENT
 
 /* =========================================================
    ## DATE HELPERS ##
@@ -178,11 +191,11 @@ function colorForSets(sets: number): string {
   const v = Number(sets || 0);
 
   // 0        = gray
-  // 0–4      = blue   (very low)
-  // 4–10     = teal   (low)
-  // 10–16    = green  (minimum / good)
+  // 0–4      = blue
+  // 4–10     = teal
+  // 10–16    = green (minimum / good)
   // 16–20    = orange (great)
-  // >20      = red    (very high / likely too much)
+  // >20      = red
   if (v <= 0) return "#6B7280"; // gray
   if (v < 4) return "#3B82F6"; // blue
   if (v < 10) return "#14B8A6"; // teal
@@ -207,6 +220,11 @@ export default function App() {
   const [workoutDate, setWorkoutDate] = useState<string>(todayLocalISO());
 
   const [doneMap, setDoneMap] = useState<Record<string, boolean>>({});
+// ## AUTOLOG STATE ##
+const [autoLogSaving, setAutoLogSaving] = useState<boolean>(false);
+const [autoLogError, setAutoLogError] = useState<string>("");
+// ## AUTOLOG STATE END ##
+
   const [logInputs, setLogInputs] = useState<
     Record<string, { reps: string; weight: string; saving?: boolean; error?: string; saved?: boolean }>
   >({});
@@ -226,7 +244,7 @@ export default function App() {
   // Muscle Balance: which muscle is currently expanded
   const [mbSelectedMuscle, setMbSelectedMuscle] = useState<string>("");
 
-  // ✅ ALWAYS carries the currently opened exercise id
+  // Current exercise id (always set when opening exercise view)
   const [activeExerciseId, setActiveExerciseId] = useState<string>("");
 
   const [exerciseBackTarget, setExerciseBackTarget] = useState<ExerciseBackTarget>("session");
@@ -345,14 +363,11 @@ export default function App() {
     return sessionExercises[selectedExerciseIndex] || null;
   }, [sessionExercises, selectedExerciseIndex]);
 
-  // ✅ Rock-solid: ALWAYS use activeExerciseId first when present
   const resolvedExerciseId = useMemo(() => {
     const a = String(activeExerciseId || "").trim();
     if (a) return a;
-
     const c = String(currentRow?.ExerciseID || "").trim();
     if (c) return c;
-
     return "";
   }, [activeExerciseId, currentRow]);
 
@@ -486,17 +501,15 @@ export default function App() {
   }
 
   /* =========================================================
-     ✅ THE FIX: OPEN EXERCISE ALWAYS HAS ExerciseID
+     ✅ OPEN EXERCISE ALWAYS HAS ExerciseID
      ========================================================= */
   function openExerciseFromMuscle(exId: string) {
     const cleanId = String(exId || "").trim();
     if (!cleanId) return;
 
-    // ✅ ALWAYS set this first (no blank ExerciseID possible)
     setActiveExerciseId(cleanId);
     setExerciseBackTarget("muscle_balance");
 
-    // If it exists in routine, also set session nav (optional)
     const row = (allExercises || []).find((r) => String(r.ExerciseID || "").trim() === cleanId);
 
     if (row) {
@@ -519,12 +532,20 @@ export default function App() {
 
   /* =========================================================
      ## BACKEND ACTIONS ##
+     ✅ LOG ANY SET (major/accessory + routine/library)
      ========================================================= */
-  async function saveMajorSet(row: RoutineExercise, setIndex: number, prescribedReps?: string, prescribedWeight?: string) {
-    const exId = String(row.ExerciseID || "");
-    const exName = String((libraryById[exId]?.Name || exId) ?? exId);
+  async function saveAnySet(args: {
+    exId: string;
+    exName: string;
+    sessionId: string;
+    sessionName: string;
+    setIndex: number;
+    prescribedReps?: string;
+    prescribedWeight?: string;
+  }) {
+    const { exId, exName, sessionId, sessionName, setIndex, prescribedReps, prescribedWeight } = args;
 
-    const k = keyLog(workoutDate, String(row.SessionID || ""), exId, setIndex);
+    const k = keyLog(workoutDate, sessionId, exId, setIndex);
     const cur = logInputs[k] || { reps: "", weight: "" };
 
     setLogInputs((m) => ({ ...m, [k]: { ...cur, saving: true, error: "", saved: false } }));
@@ -533,8 +554,8 @@ export default function App() {
       await postLogSet({
         date: workoutDate,
         routineId,
-        sessionId: String(row.SessionID || ""),
-        sessionName: String(row.SessionName || ""),
+        sessionId,
+        sessionName,
         exerciseId: exId,
         exerciseName: exName,
         setNumber: setIndex,
@@ -668,192 +689,224 @@ export default function App() {
     );
   }
 
-  /* =========================================================
-     ## VIEW: muscle_balance (SVG + ONLY LIST FOR SELECTED MUSCLE)
-     ========================================================= */
-  if (view === "muscle_balance") {
-    const dateKeys = muscleBalance.dateKeys;
+// ==============================
+// FILE: src/App.tsx
+// SECTION: VIEW: muscle_balance (FULL BLOCK REPLACEMENT)
+// ==============================
+// START MUSCLE_BALANCE VIEW REPLACEMENT
 
-    function clickMuscle(m: string) {
-      setMbSelectedMuscle((cur) => (normMuscleName(cur) === normMuscleName(m) ? "" : m));
-    }
+if (view === "muscle_balance") {
+  const dateKeys = muscleBalance.dateKeys;
 
-    // Front: chest/arms/quads/calves etc
-    // Back: traps/upper back/lats/glutes/hamstrings etc
-    const frontItems = [
-      { muscle: "Chest", x: 40, y: 25, w: 50, h: 24 },
-      { muscle: "Front Delts", x: 25, y: 25, w: 14, h: 18 },
-      { muscle: "Front Delts", x: 91, y: 25, w: 14, h: 18 },
-      { muscle: "Biceps", x: 18, y: 46, w: 16, h: 22 },
-      { muscle: "Biceps", x: 96, y: 46, w: 16, h: 22 },
-      { muscle: "Forearms", x: 14, y: 70, w: 16, h: 22 },
-      { muscle: "Forearms", x: 100, y: 70, w: 16, h: 22 },
-      { muscle: "Quads", x: 46, y: 78, w: 18, h: 30 },
-      { muscle: "Quads", x: 66, y: 78, w: 18, h: 30 },
-      { muscle: "Hip Flexors", x: 54, y: 62, w: 22, h: 14 },
-      { muscle: "Adductors", x: 56, y: 92, w: 18, h: 16 },
-      { muscle: "Calves", x: 48, y: 112, w: 16, h: 22 },
-      { muscle: "Calves", x: 68, y: 112, w: 16, h: 22 },
-      { muscle: "Tibialis Anterior", x: 48, y: 136, w: 16, h: 18 },
-      { muscle: "Tibialis Anterior", x: 68, y: 136, w: 16, h: 18 },
-    ];
+  function clickMuscle(m: string) {
+    setMbSelectedMuscle((cur) => (normMuscleName(cur) === normMuscleName(m) ? "" : m));
+  }
 
-    const backItems = [
-      { muscle: "Upper Traps", x: 48, y: 18, w: 36, h: 14 },
-      { muscle: "Upper Back", x: 44, y: 34, w: 44, h: 22 },
-      { muscle: "Lats", x: 38, y: 58, w: 56, h: 20 },
-      { muscle: "Rear Delts", x: 26, y: 34, w: 12, h: 18 },
-      { muscle: "Rear Delts", x: 94, y: 34, w: 12, h: 18 },
-      { muscle: "Triceps", x: 18, y: 52, w: 16, h: 22 },
-      { muscle: "Triceps", x: 96, y: 52, w: 16, h: 22 },
-      { muscle: "Glutes", x: 50, y: 80, w: 34, h: 20 },
-      { muscle: "Hamstrings", x: 46, y: 104, w: 18, h: 26 },
-      { muscle: "Hamstrings", x: 66, y: 104, w: 18, h: 26 },
-      { muscle: "Calves", x: 48, y: 132, w: 16, h: 22 },
-      { muscle: "Calves", x: 68, y: 132, w: 16, h: 22 },
-    ];
+  // Map SVG tokens (inkscape:label / id) -> your Exercise_Library muscle names
+  // (keep this small and expand as you add labels)
+  function mapTokenToMuscle(tokenRaw: string): string {
+    const t = String(tokenRaw || "").trim();
+    const n = normMuscleName(t);
 
-    function svgFigure(items: { muscle: string; x: number; y: number; w: number; h: number }[], title: string) {
-      return (
-        <div style={{ flex: 1 }}>
-          <div className="muted small" style={{ marginBottom: 6, fontWeight: 900 }}>
-            {title}
-          </div>
+    const map: Record<string, string> = {
+      // common label -> library muscle name
+      "traps": "Upper Traps",
+      "upper traps": "Upper Traps",
+      "rear delts": "Rear Delts",
+      "rear deltoids": "Rear Delts",
+      "front delts": "Front Delts",
+      "front deltoids": "Front Delts",
+      "lats": "Lats",
+      "upper back": "Upper Back",
+      "hamstrings": "Hamstrings",
+      "glutes": "Glutes",
+      "quads": "Quads",
+      "calves": "Calves",
+      "chest": "Chest",
+      "biceps": "Biceps",
+      "triceps": "Triceps",
+      "forearms": "Forearms",
+      "adductors": "Adductors",
+      "hip flexors": "Hip Flexors",
+      "tibialis anterior": "Tibialis Anterior",
+      "spinal erectors": "Spinal erectors",
+      "rhomboids": "Rhomboids",
+      "scapulae": "Scapulae",
+      "teres major": "Teres Major",
+    };
 
-          <svg viewBox="0 0 140 170" width="100%" style={{ borderRadius: 14, background: "rgba(255,255,255,0.04)" }}>
-            {/* silhouette */}
-            <rect x="55" y="8" width="30" height="18" rx="9" opacity="0.15" />
-            <rect x="52" y="28" width="36" height="46" rx="18" opacity="0.12" />
-            <rect x="54" y="74" width="32" height="28" rx="14" opacity="0.12" />
-            <rect x="46" y="100" width="48" height="52" rx="18" opacity="0.12" />
+    // If we have a known mapping, use it.
+    if (map[n]) return map[n];
 
-            {items.map((it, idx) => {
-              const sets = setsForMuscle(it.muscle);
-              const fill = colorForSets(sets);
-              const isOpen = normMuscleName(mbSelectedMuscle) === normMuscleName(it.muscle);
+    // Otherwise, just return the token itself (lets you use labels that already match library)
+    return t;
+  }
 
-              return (
-                <g key={`${it.muscle}-${idx}`} style={{ cursor: "pointer" }} onClick={() => clickMuscle(it.muscle)}>
-                  <rect x={it.x} y={it.y} width={it.w} height={it.h} rx="6" fill={fill} opacity={isOpen ? 0.95 : 0.75} />
-                </g>
-              );
-            })}
-          </svg>
+  function handleMuscleToken(token: string) {
+    if (!token || token === "UNKNOWN") return;
+    const muscle = mapTokenToMuscle(token);
+    if (!muscle) return;
+    clickMuscle(muscle);
+  }
+
+  function colorForToken(token: string): string | null {
+    const muscle = mapTokenToMuscle(token);
+    if (!muscle) return null;
+    const sets = setsForMuscle(muscle);
+    return colorForSets(sets);
+  }
+
+  function isSelectedToken(token: string): boolean {
+    const muscle = mapTokenToMuscle(token);
+    if (!muscle) return false;
+    return normMuscleName(muscle) === normMuscleName(mbSelectedMuscle);
+  }
+
+  const selected = String(mbSelectedMuscle || "").trim();
+  const selectedSets = selected ? setsForMuscle(selected) : 0;
+
+  return (
+    <div className="app">
+      <div className="page">
+        <div className="headerRow">
+          <button className="pill" onClick={() => setView("sessions")}>
+            ← Home
+          </button>
+          <div className="titleSmall">Muscle Balance</div>
         </div>
-      );
-    }
 
-    const selected = String(mbSelectedMuscle || "").trim();
-    const selectedSets = selected ? setsForMuscle(selected) : 0;
-
-    return (
-      <div className="app">
-        <div className="page">
-          <div className="headerRow">
-            <button className="pill" onClick={() => setView("sessions")}>
-              ← Home
-            </button>
-            <div className="titleSmall">Muscle Balance</div>
+        <div className="noteBox" style={{ marginTop: 10 }}>
+          <div style={{ fontWeight: 900, marginBottom: 6 }}>Target</div>
+          <div className="muted small">
+            Aim for <b>10–20 hard sets per muscle</b> across your last <b>3 sessions</b>.
+            <br />
+            Primary = 1.0 • Secondary = 0.5 • WarmUp excluded
+            <br />
+            <div style={{ marginTop: 8 }}>
+              <b>Colors:</b> gray=0 • blue=0–4 • teal=4–10 • green=10–16 • orange=16–20 • red=20+
+            </div>
           </div>
+        </div>
 
-          <div className="noteBox" style={{ marginTop: 10 }}>
-            <div style={{ fontWeight: 900, marginBottom: 6 }}>Target</div>
-            <div className="muted small">
-              Aim for <b>10–20 hard sets per muscle</b> across your last <b>3 sessions</b>.
-              <br />
-              Primary = 1.0 • Secondary = 0.5 • WarmUp excluded
-              <br />
-              <div style={{ marginTop: 8 }}>
-                <b>Colors:</b>{" "}
-                gray=0 • blue=0–4 • teal=4–10 • green=10–16 • orange=16–20 • red=20+
+        <div className="noteBox" style={{ marginTop: 10 }}>
+          <div className="muted small">
+            User: <b>{userId || "—"}</b>
+            <br />
+            Dates: {dateKeys.length ? dateKeys.join(", ") : "No log dates found yet"}
+          </div>
+        </div>
+
+        <div className="block" style={{ marginTop: 12 }}>
+          <div className="blockTitle">Tap a muscle</div>
+
+          <div style={{ display: "flex", gap: 10 }}>
+            <div style={{ flex: 1 }}>
+              <div className="muted small" style={{ marginBottom: 6, fontWeight: 900 }}>
+                Front
+              </div>
+              <div style={{ borderRadius: 14, background: "rgba(255,255,255,0.04)", padding: 8 }}>
+                <MuscleMap
+                  side="front"
+                  onMuscleClick={handleMuscleToken}
+                  getColorForToken={colorForToken}
+                  isTokenSelected={isSelectedToken}
+                />
+              </div>
+            </div>
+
+            <div style={{ flex: 1 }}>
+              <div className="muted small" style={{ marginBottom: 6, fontWeight: 900 }}>
+                Back
+              </div>
+              <div style={{ borderRadius: 14, background: "rgba(255,255,255,0.04)", padding: 8 }}>
+                <MuscleMap
+                  side="back"
+                  onMuscleClick={handleMuscleToken}
+                  getColorForToken={colorForToken}
+                  isTokenSelected={isSelectedToken}
+                />
               </div>
             </div>
           </div>
 
-          <div className="noteBox" style={{ marginTop: 10 }}>
-            <div className="muted small">
-              User: <b>{userId || "—"}</b>
-              <br />
-              Dates: {dateKeys.length ? dateKeys.join(", ") : "No log dates found yet"}
-            </div>
-          </div>
-
-          {/* SVG BODY MAP */}
-          <div className="block" style={{ marginTop: 12 }}>
-            <div className="blockTitle">Tap a muscle</div>
-            <div style={{ display: "flex", gap: 10 }}>
-              {svgFigure(frontItems, "Front")}
-              {svgFigure(backItems, "Back")}
-            </div>
-
-            {!selected ? (
-              <div className="muted small" style={{ marginTop: 10 }}>
-                Tap any muscle on the body map to see exercises for that muscle.
-              </div>
-            ) : null}
-          </div>
-
-          {/* ONLY SHOW EXERCISES FOR SELECTED MUSCLE */}
-          {selected ? (
-            <div className="block" style={{ marginTop: 12 }}>
-              <div className="blockTitle">
-                {selected}{" "}
-                <span className="chip" style={{ marginLeft: 8, background: colorForSets(selectedSets) as any }}>
-                  {selectedSets.toFixed(1)}
-                </span>
-              </div>
-
-              <div className="muted small" style={{ marginBottom: 10 }}>
-                Primary (+1.0) and Secondary (+0.5) exercises from Exercise_Library
-              </div>
-
-              <div className="stack">
-                <div className="muted small" style={{ fontWeight: 900 }}>
-                  Primary (+1.0)
-                </div>
-
-                {!mbPrimaryExerciseIds.length ? (
-                  <div className="muted small">No primary exercises for this muscle in Exercise_Library.</div>
-                ) : (
-                  mbPrimaryExerciseIds
-                    .slice()
-                    .sort((a, b) => exerciseNameFor(a).localeCompare(exerciseNameFor(b)))
-                    .map((exId) => (
-                      <button key={`MBP-${exId}`} className={`bubble bubble--main`.trim()} onClick={() => openExerciseFromMuscle(exId)}>
-                        <div className="bubbleTitle">{exerciseNameFor(exId)}</div>
-                        {exerciseNotesFor(exId) ? <div className="bubbleSub muted">{exerciseNotesFor(exId)}</div> : null}
-                      </button>
-                    ))
-                )}
-
-                <div className="muted small" style={{ fontWeight: 900, marginTop: 10 }}>
-                  Secondary (+0.5)
-                </div>
-
-                {!mbSecondaryExerciseIds.length ? (
-                  <div className="muted small">No secondary exercises for this muscle in Exercise_Library.</div>
-                ) : (
-                  mbSecondaryExerciseIds
-                    .slice()
-                    .sort((a, b) => exerciseNameFor(a).localeCompare(exerciseNameFor(b)))
-                    .map((exId) => (
-                      <button key={`MBS-${exId}`} className={`bubble bubble--main`.trim()} onClick={() => openExerciseFromMuscle(exId)}>
-                        <div className="bubbleTitle">{exerciseNameFor(exId)}</div>
-                        {exerciseNotesFor(exId) ? <div className="bubbleSub muted">{exerciseNotesFor(exId)}</div> : null}
-                      </button>
-                    ))
-                )}
-
-                <button className="pill" style={{ marginTop: 12 }} onClick={() => setMbSelectedMuscle("")}>
-                  Clear selection
-                </button>
-              </div>
+          {!selected ? (
+            <div className="muted small" style={{ marginTop: 10 }}>
+              Tap any muscle on the body map to see exercises for that muscle.
             </div>
           ) : null}
         </div>
+
+        {selected ? (
+          <div className="block" style={{ marginTop: 12 }}>
+            <div className="blockTitle">
+              {selected}{" "}
+              <span className="chip" style={{ marginLeft: 8, background: colorForSets(selectedSets) as any }}>
+                {selectedSets.toFixed(1)}
+              </span>
+            </div>
+
+            <div className="muted small" style={{ marginBottom: 10 }}>
+              Primary (+1.0) and Secondary (+0.5) exercises from Exercise_Library
+            </div>
+
+            <div className="stack">
+              <div className="muted small" style={{ fontWeight: 900 }}>
+                Primary (+1.0)
+              </div>
+
+              {!mbPrimaryExerciseIds.length ? (
+                <div className="muted small">No primary exercises for this muscle in Exercise_Library.</div>
+              ) : (
+                mbPrimaryExerciseIds
+                  .slice()
+                  .sort((a, b) => exerciseNameFor(a).localeCompare(exerciseNameFor(b)))
+                  .map((exId) => (
+                    <button
+                      key={`MBP-${exId}`}
+                      className={`bubble bubble--main`.trim()}
+                      onClick={() => openExerciseFromMuscle(exId)}
+                    >
+                      <div className="bubbleTitle">{exerciseNameFor(exId)}</div>
+                      {exerciseNotesFor(exId) ? <div className="bubbleSub muted">{exerciseNotesFor(exId)}</div> : null}
+                    </button>
+                  ))
+              )}
+
+              <div className="muted small" style={{ fontWeight: 900, marginTop: 10 }}>
+                Secondary (+0.5)
+              </div>
+
+              {!mbSecondaryExerciseIds.length ? (
+                <div className="muted small">No secondary exercises for this muscle in Exercise_Library.</div>
+              ) : (
+                mbSecondaryExerciseIds
+                  .slice()
+                  .sort((a, b) => exerciseNameFor(a).localeCompare(exerciseNameFor(b)))
+                  .map((exId) => (
+                    <button
+                      key={`MBS-${exId}`}
+                      className={`bubble bubble--main`.trim()}
+                      onClick={() => openExerciseFromMuscle(exId)}
+                    >
+                      <div className="bubbleTitle">{exerciseNameFor(exId)}</div>
+                      {exerciseNotesFor(exId) ? <div className="bubbleSub muted">{exerciseNotesFor(exId)}</div> : null}
+                    </button>
+                  ))
+              )}
+
+              <button className="pill" style={{ marginTop: 12 }} onClick={() => setMbSelectedMuscle("")}>
+                Clear selection
+              </button>
+            </div>
+          </div>
+        ) : null}
       </div>
-    );
-  }
+    </div>
+  );
+}
+
+// END MUSCLE_BALANCE VIEW REPLACEMENT
+
 
   /* =========================================================
      ## VIEW: session ##
@@ -920,10 +973,7 @@ export default function App() {
 
                           setSelectedExerciseIndex(Math.max(0, absoluteIdx));
                           setExerciseBackTarget("session");
-
-                          // ✅ IMPORTANT: always set activeExerciseId so Exercise view never opens blank
                           setActiveExerciseId(exId);
-
                           setView("exercise");
                         }}
                       >
@@ -950,9 +1000,8 @@ export default function App() {
       </div>
     );
   }
-
-  /* =========================================================
-     ## VIEW: exercise (works with or without session context)
+/* =========================================================
+     ## VIEW: exercise (LOG EVERYTHING)
      ========================================================= */
   if (view === "exercise") {
     const exId = String(resolvedExerciseId || "").trim();
@@ -963,7 +1012,10 @@ export default function App() {
         <div className="app">
           <div className="page">
             <div className="headerRow">
-              <button className="pill" onClick={() => setView(exerciseBackTarget === "muscle_balance" ? "muscle_balance" : "session")}>
+              <button
+                className="pill"
+                onClick={() => setView(exerciseBackTarget === "muscle_balance" ? "muscle_balance" : "session")}
+              >
                 ← Back
               </button>
               <div className="titleSmall">Exercise</div>
@@ -982,18 +1034,36 @@ export default function App() {
 
     const name = String(lib?.Name || exId);
 
-    // scheme from:
-    // 1) Routine exercise row (if this exercise exists in currentRow)
-    // 2) Exercise_Library.SchemeID fallback (your new column)
+    // if currentRow matches exId, we are in a Routine_Exercises session context
+    const inSession =
+      !!currentRow && String(currentRow.ExerciseID || "") === exId && !!currentRow.SessionID;
+
+    // library-only fallback context
+    const sessionIdForLogging = inSession ? String(currentRow?.SessionID || "") : "LIBRARY";
+    const sessionNameForLogging = inSession
+      ? String(currentRow?.SessionName || currentSession?.SessionName || "")
+      : "Exercise Library";
+
+    const blockLabel = String(
+      inSession ? (currentRow?.Block || lib?.Category || "") : (lib?.Category || "")
+    );
+
+    // Determine "Main" vs "Non-main"
+    const isMain =
+      String(blockLabel || "").toLowerCase() === "main" ||
+      String(lib?.LogMode || "").toLowerCase() === "main" ||
+      String(lib?.Category || "").toLowerCase() === "main";
+
+    // Scheme selection: prefer Routine_Exercises.SchemeID when in session
     const routineSchemeId = String(currentRow?.ExerciseID === exId ? currentRow?.SchemeID || "" : "");
     const schemeId = String(routineSchemeId || lib?.SchemeID || "");
+
     const schemeRowsRaw = (schemesById[schemeId] || []) as any[];
     const schemeRows = schemeRowsRaw.filter(Boolean);
 
     const unit = String(lib?.Unit || currentUnit || "");
-    const isWeighted = unit === "lb" || unit === "kg";
-
-    const major = isMajor(lib, currentRow?.Notes);
+    const unitLower = unit.toLowerCase();
+    const isWeighted = unitLower === "lb" || unitLower === "lbs" || unitLower === "kg" || unitLower === "kgs";
 
     const tm =
       toNumber(currentMaxRow?.TrainingMax) ??
@@ -1008,15 +1078,79 @@ export default function App() {
       return String(rmin || rmax || "");
     }
 
-    function plannedWeightLabel(s: any) {
+    // planned weight numeric only (no unit suffix)
+    function plannedWeightNumber(s: any) {
       const pct = toNumber(s?.PctTM);
       if (pct == null || tm == null) return "";
-      const raw = (tm as number) * (pct as number);
 
+      const raw = (tm as number) * (pct as number);
       const step = toNumber(s?.RoundTo);
       const rounded = step != null && step > 0 ? Math.round(raw / step) * step : raw;
 
-      return fmtWeight(rounded, unit);
+      return String(fmtWeight(rounded)).trim();
+    }
+
+    // robust setIndex: supports multiple possible header names
+    function getSetIndex(s: any, fallback: number) {
+      const v =
+        s?.SetIndex ??
+        s?.SetNumber ??
+        s?.Set ??
+        s?.Index ??
+        s?.Order ??
+        fallback;
+      const n = Number(v);
+      return isFinite(n) && n > 0 ? n : fallback;
+    }
+
+    const doneKey = keyDone(workoutDate, sessionIdForLogging, exId);
+    const isDone = !!doneMap[doneKey];
+
+    // ✅ logs every set row for non-main, using either user-filled inputs OR planned defaults
+    async function autoLogAllSets() {
+      if (!schemeRows.length) return;
+
+      for (let i = 0; i < schemeRows.length; i++) {
+        const s = schemeRows[i];
+
+        const setIndex = getSetIndex(s, i + 1);
+        const repsPlanned = repsLabelForScheme(s);
+        const wtPlannedNum = plannedWeightNumber(s);
+
+        const k = keyLog(workoutDate, sessionIdForLogging, exId, setIndex);
+        const cur = logInputs[k] || { reps: "", weight: "" };
+
+        // ✅ if user didn't type anything, use planned values automatically
+        const actualReps = String(cur.reps || repsPlanned || "").trim();
+        const actualWeight = isWeighted ? String(cur.weight || wtPlannedNum || "").trim() : "";
+
+        // show saving state
+        setLogInputs((m) => ({ ...m, [k]: { ...cur, saving: true, error: "", saved: false } }));
+
+        try {
+          await postLogSet({
+            date: workoutDate,
+            routineId: routineId,
+            sessionId: sessionIdForLogging,
+            sessionName: sessionNameForLogging,
+            exerciseId: exId,
+            exerciseName: name,
+            setNumber: setIndex,
+            prescribedReps: repsPlanned,
+            prescribedWeight: wtPlannedNum, // numeric only
+            actualReps: actualReps,
+            actualWeight: actualWeight,
+            notes: "AUTO_DONE",
+          });
+
+          setLogInputs((m) => ({ ...m, [k]: { ...m[k], saving: false, saved: true, error: "" } }));
+        } catch (e: any) {
+          setLogInputs((m) => ({
+            ...m,
+            [k]: { ...m[k], saving: false, saved: false, error: String(e?.message || e) },
+          }));
+        }
+      }
     }
 
     const estW = toNumber(oneRMEstWeight);
@@ -1024,10 +1158,6 @@ export default function App() {
     const estOneRM = estW != null && estR != null && estW > 0 && estR > 0 ? estW * (1 + estR / 30) : null;
 
     const canTryNextGif = gifTryIndex + 1 < gifSources.length;
-
-    const inSession = !!currentRow && String(currentRow.ExerciseID || "") === exId && !!currentRow.SessionID;
-    const doneKey = inSession ? keyDone(workoutDate, String(currentRow?.SessionID || ""), exId) : "";
-    const isDone = doneKey ? !!doneMap[doneKey] : false;
 
     return (
       <div className="app">
@@ -1047,7 +1177,7 @@ export default function App() {
 
           <div className="title">{name}</div>
           <div className="muted" style={{ marginBottom: 10 }}>
-            {String(currentRow?.Block || lib?.Category || "")}
+            {blockLabel}
           </div>
 
           {lib?.Notes ? <div className="noteBox">{String(lib.Notes)}</div> : null}
@@ -1061,44 +1191,69 @@ export default function App() {
             </div>
           ) : (
             <div className="sets">
-              {schemeRows.map((s: any) => {
-                const setIndex = Number(s?.SetIndex ?? 0);
-                const setLabel = String(s?.SetLabel || `Set ${setIndex || "?"}`);
+              {schemeRows.map((s: any, i: number) => {
+                const setIndex = getSetIndex(s, i + 1);
+                const setLabel = String(s?.SetLabel || `Set ${setIndex}`);
 
-                const repsLabel = repsLabelForScheme(s);
-                const weightLabel = plannedWeightLabel(s);
+                const repsPlanned = repsLabelForScheme(s);
+                const wtPlannedNum = plannedWeightNumber(s);
 
-                const sidForKey = inSession ? String(currentRow?.SessionID || "") : "LIBRARY";
-                const k = keyLog(workoutDate, sidForKey, exId, setIndex);
+                const k = keyLog(workoutDate, sessionIdForLogging, exId, setIndex);
                 const cur = logInputs[k] || { reps: "", weight: "" };
 
+                // ✅ auto-populated defaults (but still editable)
+                const repsValue = cur.reps || repsPlanned || "";
+                const weightValue = cur.weight || wtPlannedNum || "";
+
                 return (
-                  <div key={String(s?.SetIndex ?? Math.random())} className="setRow">
+                  <div key={`${exId}-${setIndex}`} className="setRow">
                     <div className="setLeft">
                       <div className="setLabel">{setLabel}</div>
                       <div className="setMeta">
-                        {repsLabel ? `Reps: ${repsLabel}` : "Reps: —"}
-                        {weightLabel ? ` • Planned: ${weightLabel}` : ""}
+                        {repsPlanned ? `Reps: ${repsPlanned}` : "Reps: —"}
+                        {wtPlannedNum ? ` • Planned: ${wtPlannedNum}` : ""}
                       </div>
                     </div>
 
-                    {major ? (
-                      <div className="setRight">
-                        <input className="miniInput" placeholder="reps" value={cur.reps} onChange={(e) => setLogField(k, "reps", e.target.value)} />
-                        <input className="miniInput" placeholder={unit || "wt"} value={cur.weight} onChange={(e) => setLogField(k, "weight", e.target.value)} />
+                    <div className="setRight">
+                      <input
+                        className="miniInput"
+                        placeholder="reps"
+                        value={repsValue}
+                        onChange={(e) => setLogField(k, "reps", e.target.value)}
+                      />
 
-                        {inSession ? (
-                          <button className="pill small" disabled={!!cur.saving} onClick={() => saveMajorSet(currentRow as any, setIndex, repsLabel, weightLabel)}>
-                            {cur.saving ? "Saving…" : "Save"}
-                          </button>
-                        ) : (
-                          <span className="chip">Library view</span>
-                        )}
+                      {isWeighted ? (
+                        <input
+                          className="miniInput"
+                          placeholder={unit || "wt"}
+                          value={weightValue}
+                          onChange={(e) => setLogField(k, "weight", e.target.value)}
+                        />
+                      ) : null}
 
-                        {cur.saved ? <span className="chip chipDone">SAVED</span> : null}
-                        {cur.error ? <span className="chip chipMajor">ERR</span> : null}
-                      </div>
-                    ) : null}
+                      {/* Manual save still possible (useful for Main) */}
+                      <button
+                        className="pill small"
+                        disabled={!!cur.saving}
+                        onClick={() =>
+                          saveAnySet({
+                            exId,
+                            exName: name,
+                            sessionId: sessionIdForLogging,
+                            sessionName: sessionNameForLogging,
+                            setIndex,
+                            prescribedReps: repsPlanned,
+                            prescribedWeight: wtPlannedNum, // numeric only
+                          })
+                        }
+                      >
+                        {cur.saving ? "Saving…" : "Save"}
+                      </button>
+
+                      {cur.saved ? <span className="chip chipDone">SAVED</span> : null}
+                      {cur.error ? <span className="chip chipMajor">ERR</span> : null}
+                    </div>
 
                     {cur.error ? (
                       <div className="error small" style={{ marginTop: 8 }}>
@@ -1111,14 +1266,32 @@ export default function App() {
             </div>
           )}
 
-          {!major && inSession ? (
-            <div className="navRow">
-              <button className={`pill ${isDone ? "pillDone" : ""}`} onClick={() => setDoneMap((m) => ({ ...m, [doneKey]: !m[doneKey] }))}>
-                {isDone ? "✅ Done" : "Mark done"}
-              </button>
-            </div>
-          ) : null}
+                  {/* ✅ Done / Auto-log button:
+              - NON-MAIN: primary workflow (logs all sets)
+              - MAIN: optional shortcut (still allows per-set Save) */}
+          <div className="navRow">
+            <button
+              className={`pill ${isDone ? "pillDone" : ""}`}
+              onClick={async () => {
+                const next = !isDone;
+                setDoneMap((m) => ({ ...m, [doneKey]: next }));
 
+                // only auto-log when turning ON
+                if (next) {
+                  await autoLogAllSets();
+                }
+              }}
+            >
+              {isDone
+                ? "✅ Done"
+                : isMain
+                ? "Auto log all sets (optional)"
+                : "Mark ✅ Done (auto log all sets)"}
+            </button>
+          </div>
+
+
+          {/* 1RM UI stays for weighted exercises */}
           {isWeighted ? (
             <div className="noteBox" style={{ marginTop: 12 }}>
               <div style={{ fontWeight: 900, marginBottom: 6 }}>1RM</div>
@@ -1128,8 +1301,18 @@ export default function App() {
               </div>
 
               <div className="setRight" style={{ marginTop: 0 }}>
-                <input className="miniInput" placeholder={`weight (${unit})`} value={oneRMEstWeight} onChange={(e) => setOneRMEstWeight(e.target.value)} />
-                <input className="miniInput" placeholder="reps" value={oneRMEstReps} onChange={(e) => setOneRMEstReps(e.target.value)} />
+                <input
+                  className="miniInput"
+                  placeholder={`weight (${unit})`}
+                  value={oneRMEstWeight}
+                  onChange={(e) => setOneRMEstWeight(e.target.value)}
+                />
+                <input
+                  className="miniInput"
+                  placeholder="reps"
+                  value={oneRMEstReps}
+                  onChange={(e) => setOneRMEstReps(e.target.value)}
+                />
                 <span className="chip">Est: {estOneRM != null ? fmtWeight(estOneRM, unit) : "—"}</span>
               </div>
 
@@ -1147,7 +1330,12 @@ export default function App() {
                   Set 1RM = Est
                 </button>
 
-                <input className="miniInput" placeholder={`1RM (${unit})`} value={oneRMInput} onChange={(e) => setOneRMInput(e.target.value)} />
+                <input
+                  className="miniInput"
+                  placeholder={`1RM (${unit})`}
+                  value={oneRMInput}
+                  onChange={(e) => setOneRMInput(e.target.value)}
+                />
 
                 <button className="pill small" disabled={oneRMSaving || !exId} onClick={() => saveOneRM(exId)}>
                   {oneRMSaving ? "Saving…" : "Save 1RM"}
@@ -1164,6 +1352,7 @@ export default function App() {
             </div>
           ) : null}
 
+          {/* GIF */}
           {rawGif ? (
             <div className="gifWrap">
               <div className="muted small">Demo</div>
@@ -1189,7 +1378,11 @@ export default function App() {
               <button className="pill small" onClick={() => goPrevExercise(sessionExercises.length)} disabled={selectedExerciseIndex <= 0}>
                 ← Prev
               </button>
-              <button className="pill small" onClick={() => goNextExercise(sessionExercises.length)} disabled={selectedExerciseIndex >= sessionExercises.length - 1}>
+              <button
+                className="pill small"
+                onClick={() => goNextExercise(sessionExercises.length)}
+                disabled={selectedExerciseIndex >= sessionExercises.length - 1}
+              >
                 Next →
               </button>
             </div>
@@ -1198,6 +1391,10 @@ export default function App() {
       </div>
     );
   }
+  /* =========================================================
+     ## VIEW: exercise (LOG EVERYTHING) END ##
+     ========================================================= */
+
 
   /* =========================================================
      ## SAFETY FALLBACK ##
