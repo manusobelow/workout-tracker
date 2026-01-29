@@ -1250,15 +1250,30 @@ if (view === "muscle_balance") {
       return (
         <div className="app">
           <div className="page">
-            <div className="headerRow">
-              <button
-                className="pill"
-                onClick={() => setView(exerciseBackTarget === "muscle_balance" ? "muscle_balance" : "session")}
-              >
-                ← Back
-              </button>
-              <div className="titleSmall">Exercise</div>
-            </div>
+           <div className="headerRow">
+  <button
+    className="pill"
+    onClick={() => {
+      if (exerciseBackTarget === "library") {
+        setView("library");
+        return;
+      }
+      if (exerciseBackTarget === "muscle_balance") {
+        setView("muscle_balance");
+        return;
+      }
+      if (!selectedSessionId || !currentSession) {
+        setView("sessions");
+        return;
+      }
+      setView("session");
+    }}
+  >
+    ← Back
+  </button>
+  <div className="titleSmall">Exercise</div>
+</div>
+
 
             <div className="error">
               Exercise not found in Exercise_Library.
@@ -1401,18 +1416,30 @@ if (view === "muscle_balance") {
     return (
       <div className="app">
         <div className="page">
-          <div className="headerRow">
-            <button
-              className="pill"
-              onClick={() => {
-                if (exerciseBackTarget === "muscle_balance") setView("muscle_balance");
-                else setView("session");
-              }}
-            >
-              ← Back
-            </button>
-            <div className="titleSmall">{currentSession?.SessionName || "Exercise"}</div>
-          </div>
+         <div className="headerRow">
+  <button
+    className="pill"
+    onClick={() => {
+      if (exerciseBackTarget === "library") {
+        setView("library");
+        return;
+      }
+      if (exerciseBackTarget === "muscle_balance") {
+        setView("muscle_balance");
+        return;
+      }
+      if (!selectedSessionId || !currentSession) {
+        setView("sessions");
+        return;
+      }
+      setView("session");
+    }}
+  >
+    ← Back
+  </button>
+
+  <div className="titleSmall">{currentSession?.SessionName || "Exercise"}</div>
+</div>
 
           <div className="title">{name}</div>
           <div className="muted" style={{ marginBottom: 10 }}>
