@@ -46,14 +46,23 @@ import MuscleMap from "./components/MuscleMap";
 // ==============================
 // START VIEW TYPES REPLACEMENT
 
-type View = "sessions" | "muscle_balance" | "session" | "exercise";
+type View = "sessions" | "muscle_balance" | "library" | "session" | "exercise";
+
+// ✅ used by Exercise view "Back" logic
+type ExerciseBackTarget = "session" | "muscle_balance" | "library";
+
+// ✅ Exercise Library browsing facets + stepper
+type LibraryFacetKey = "MovementPattern" | "PlaneOfMotion" | "PrimaryMuscle" | "SecondaryMuscle";
+type LibraryStep = "facet" | "value" | "exercise";
 
 function normalizeView(v: any): View {
-  if (v === "sessions" || v === "muscle_balance" || v === "session" || v === "exercise") return v;
+  if (v === "sessions" || v === "muscle_balance" || v === "library" || v === "session" || v === "exercise") return v;
   return "sessions";
 }
 
 // END VIEW TYPES REPLACEMENT
+
+
 
 /* =========================================================
    ## DATE HELPERS ##
@@ -243,6 +252,13 @@ const [autoLogError, setAutoLogError] = useState<string>("");
 
   // Muscle Balance: which muscle is currently expanded
   const [mbSelectedMuscle, setMbSelectedMuscle] = useState<string>("");
+
+  // ✅ Exercise Library browsing state
+  const [libStep, setLibStep] = useState<LibraryStep>("facet");
+  const [libFacet, setLibFacet] = useState<LibraryFacetKey>("PrimaryMuscle");
+  const [libFacetValue, setLibFacetValue] = useState<string>("");
+  const [libExerciseIds, setLibExerciseIds] = useState<string[]>([]);
+  const [libExerciseIndex, setLibExerciseIndex] = useState<number>(0);
 
   // Current exercise id (always set when opening exercise view)
   const [activeExerciseId, setActiveExerciseId] = useState<string>("");
@@ -500,7 +516,7 @@ const [autoLogError, setAutoLogError] = useState<string>("");
     return String(lib?.Notes || "");
   }
 
-  /* =========================================================
+    /* =========================================================
      ✅ OPEN EXERCISE ALWAYS HAS ExerciseID
      ========================================================= */
   function openExerciseFromMuscle(exId: string) {
@@ -529,6 +545,25 @@ const [autoLogError, setAutoLogError] = useState<string>("");
 
     setView("exercise");
   }
+
+  // ✅ Open exercise from Exercise Library filtered list
+  function openExerciseFromLibrary(exId: string, list: string[], index: number) {
+    const cleanId = String(exId || "").trim();
+    if (!cleanId) return;
+
+    setLibExerciseIds(Array.from(new Set((list || []).map((x) => String(x || "").trim()).filter(Boolean))));
+    setLibExerciseIndex(Math.max(0, index || 0));
+
+    setActiveExerciseId(cleanId);
+    setExerciseBackTarget("library");
+
+    // library context = not a routine session
+    setSelectedSessionId("");
+    setSelectedExerciseIndex(0);
+
+    setView("exercise");
+  }
+
 
   /* =========================================================
      ## BACKEND ACTIONS ##
@@ -616,7 +651,7 @@ const [autoLogError, setAutoLogError] = useState<string>("");
     );
   }
 
-  /* =========================================================
+   /* =========================================================
      ## VIEW: sessions (HOME) ##
      ========================================================= */
   if (view === "sessions") {
@@ -665,6 +700,22 @@ const [autoLogError, setAutoLogError] = useState<string>("");
             >
               <div className="bubbleTitle">Muscle Balance</div>
               <div className="bubbleSub muted">Tap muscles → see exercise options</div>
+            </button>
+
+            {/* ✅ Exercise Library entry point */}
+            <button
+              className={`bubble bubble--main`.trim()}
+              onClick={() => {
+                setLibStep("facet");
+                setLibFacet("PrimaryMuscle");
+                setLibFacetValue("");
+                setLibExerciseIds([]);
+                setLibExerciseIndex(0);
+                setView("library");
+              }}
+            >
+              <div className="bubbleTitle">Exercise Library</div>
+              <div className="bubbleSub muted">Browse by PrimaryMuscle / MovementPattern / PlaneOfMotion</div>
             </button>
 
             {sessions.map((s) => (
@@ -906,6 +957,194 @@ if (view === "muscle_balance") {
 }
 
 // END MUSCLE_BALANCE VIEW REPLACEMENT
+
+  /* =========================================================
+     ## VIEW: library (Exercise Library browser) ##
+     ========================================================= */
+  if (view === "library") {
+    const FACETS: { key: LibraryFacetKey; title: string; sub: string }[] = [
+      { key: "PrimaryMuscle", title: "PrimaryMuscle", sub: "Group exercises by primary muscle" },
+      { key: "SecondaryMuscle", title: "SecondaryMuscle", sub: "Group exercises by secondary muscle" },
+      { key: "MovementPattern", title: "MovementPattern", sub: "Squat / Hinge / Push / Pull / etc" },
+      { key: "PlaneOfMotion", title: "PlaneOfMotion", sub: "Sagittal / Frontal / Transverse / Multi" },
+    ];
+
+    function normFacet(v: any) {
+      return String(v || "")
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, " ");
+    }
+
+    const facetMeta = FACETS.find((f) => f.key === libFacet) || FACETS[0];
+
+    const facetValues = (() => {
+      const seen = new Map<string, { key: string; label: string; count: number }>();
+
+      for (const exId of libraryExerciseIds) {
+        const lib = libraryById[String(exId)] as any;
+        if (!lib) continue;
+
+        const raw = String((lib as any)?.[libFacet] || "").trim();
+        if (!raw) continue;
+
+        const k = normFacet(raw);
+        const cur = seen.get(k);
+        if (cur) cur.count += 1;
+        else seen.set(k, { key: k, label: raw, count: 1 });
+      }
+
+      const out = Array.from(seen.values());
+      out.sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+      return out;
+    })();
+
+    const exercisesForSelected = (() => {
+      if (libStep !== "exercise" || !libFacetValue) return [] as string[];
+
+      const target = normFacet(libFacetValue);
+      const out: string[] = [];
+
+      for (const exId of libraryExerciseIds) {
+        const lib = libraryById[String(exId)] as any;
+        if (!lib) continue;
+
+        const raw = String((lib as any)?.[libFacet] || "");
+        if (normFacet(raw) === target) out.push(String(exId));
+      }
+
+      out.sort((a, b) => exerciseNameFor(a).localeCompare(exerciseNameFor(b)));
+      return out;
+    })();
+
+    const headerTitle =
+      libStep === "facet"
+        ? "Exercise Library"
+        : libStep === "value"
+        ? `Exercise Library • ${facetMeta.title}`
+        : `Exercise Library • ${facetMeta.title}: ${libFacetValue || "—"}`;
+
+    return (
+      <div className="app">
+        <div className="page">
+          <div className="headerRow">
+            <button
+              className="pill"
+              onClick={() => {
+                if (libStep === "facet") {
+                  setView("sessions");
+                  return;
+                }
+                if (libStep === "value") {
+                  setLibStep("facet");
+                  setLibFacetValue("");
+                  setLibExerciseIds([]);
+                  setLibExerciseIndex(0);
+                  return;
+                }
+                // exercise list
+                setLibStep("value");
+                setLibExerciseIds([]);
+                setLibExerciseIndex(0);
+              }}
+            >
+              ← Back
+            </button>
+            <div className="titleSmall">{headerTitle}</div>
+          </div>
+
+          {libStep === "facet" ? (
+            <div className="stack" style={{ marginTop: 10 }}>
+              {FACETS.map((f) => (
+                <button
+                  key={f.key}
+                  className={`bubble bubble--main`.trim()}
+                  onClick={() => {
+                    setLibFacet(f.key);
+                    setLibStep("value");
+                    setLibFacetValue("");
+                    setLibExerciseIds([]);
+                    setLibExerciseIndex(0);
+                  }}
+                >
+                  <div className="bubbleTitle">{f.title}</div>
+                  <div className="bubbleSub muted">{f.sub}</div>
+                </button>
+              ))}
+            </div>
+          ) : null}
+
+          {libStep === "value" ? (
+            <div className="block" style={{ marginTop: 12 }}>
+              <div className="blockTitle">Pick a {facetMeta.title}</div>
+
+              {!facetValues.length ? (
+                <div className="muted small">No values found for {facetMeta.title}.</div>
+              ) : (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                  {facetValues.map((v) => (
+                    <button
+                      key={v.key}
+                      className="pill small"
+                      onClick={() => {
+                        setLibFacetValue(v.label);
+                        setLibStep("exercise");
+
+                        // precompute the list so Exercise view can Prev/Next through it
+                        const list: string[] = [];
+                        const target = normFacet(v.label);
+
+                        for (const exId of libraryExerciseIds) {
+                          const lib = libraryById[String(exId)] as any;
+                          if (!lib) continue;
+                          const raw = String((lib as any)?.[libFacet] || "");
+                          if (normFacet(raw) === target) list.push(String(exId));
+                        }
+
+                        list.sort((a, b) => exerciseNameFor(a).localeCompare(exerciseNameFor(b)));
+
+                        setLibExerciseIds(list);
+                        setLibExerciseIndex(0);
+                      }}
+                      title={`${v.count} exercises`}
+                    >
+                      {v.label}{" "}
+                      <span className="chip" style={{ marginLeft: 8 }}>
+                        {v.count}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : null}
+
+          {libStep === "exercise" ? (
+            <div className="block" style={{ marginTop: 12 }}>
+              <div className="blockTitle">Exercises</div>
+
+              {!exercisesForSelected.length ? (
+                <div className="muted small">No exercises found for this selection.</div>
+              ) : (
+                <div className="stack">
+                  {exercisesForSelected.map((exId, idx) => (
+                    <button
+                      key={`LIB-${exId}`}
+                      className={`bubble bubble--main`.trim()}
+                      onClick={() => openExerciseFromLibrary(exId, exercisesForSelected, idx)}
+                    >
+                      <div className="bubbleTitle">{exerciseNameFor(exId)}</div>
+                      {exerciseNotesFor(exId) ? <div className="bubbleSub muted">{exerciseNotesFor(exId)}</div> : null}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : null}
+        </div>
+      </div>
+    );
+  }
 
 
   /* =========================================================
