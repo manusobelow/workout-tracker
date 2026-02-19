@@ -272,12 +272,35 @@ const [autoLogError, setAutoLogError] = useState<string>("");
     setLogInputs((m) => ({ ...m, [k]: { ...(m[k] || { reps: "", weight: "" }), [field]: v } }));
   }
 
-  function goPrevExercise(maxLen: number) {
-    setSelectedExerciseIndex((i) => Math.max(0, Math.min(maxLen - 1, i - 1)));
+// =======================
+// NAV HELPERS START
+// =======================
+function goToExerciseIndex(nextIndex: number, maxLen: number) {
+  const safe = Math.max(0, Math.min(maxLen - 1, nextIndex));
+  setSelectedExerciseIndex(safe);
+
+  // ✅ Critical: keep resolvedExerciseId in sync while in a session
+  const nextRow = sessionExercises[safe];
+  if (nextRow?.ExerciseID) {
+    setActiveExerciseId(String(nextRow.ExerciseID).trim());
+    setExerciseBackTarget("session");
+  } else {
+    // fallback: unpin
+    setActiveExerciseId("");
   }
-  function goNextExercise(maxLen: number) {
-    setSelectedExerciseIndex((i) => Math.max(0, Math.min(maxLen - 1, i + 1)));
-  }
+}
+
+function goPrevExercise(maxLen: number) {
+  goToExerciseIndex(selectedExerciseIndex - 1, maxLen);
+}
+
+function goNextExercise(maxLen: number) {
+  goToExerciseIndex(selectedExerciseIndex + 1, maxLen);
+}
+// =======================
+// NAV HELPERS END
+// =======================
+
 
   /* =========================================================
      ## BOOTSTRAP ##
@@ -569,73 +592,61 @@ const [autoLogError, setAutoLogError] = useState<string>("");
      ## BACKEND ACTIONS ##
      ✅ LOG ANY SET (major/accessory + routine/library)
      ========================================================= */
-  async function saveAnySet(args: {
-    exId: string;
-    exName: string;
-    sessionId: string;
-    sessionName: string;
-    setIndex: number;
-    prescribedReps?: string;
-    prescribedWeight?: string;
-  }) {
-    const { exId, exName, sessionId, sessionName, setIndex, prescribedReps, prescribedWeight } = args;
+  // =======================
+// SAVEANYSET REPLACEMENT START
+// =======================
+async function saveAnySet(args: {
+  exId: string;
+  exName: string;
+  sessionId: string;
+  sessionName: string;
+  setIndex: number;
+  prescribedReps?: string;
+  prescribedWeight?: string; // IMPORTANT: numeric-only string (no "lb" / "kg")
+}) {
+  const { exId, exName, sessionId, sessionName, setIndex, prescribedReps, prescribedWeight } = args;
 
-    const k = keyLog(workoutDate, sessionId, exId, setIndex);
-    const cur = logInputs[k] || { reps: "", weight: "" };
+  const k = keyLog(workoutDate, sessionId, exId, setIndex);
+  const cur = logInputs[k] || { reps: "", weight: "" };
 
-    setLogInputs((m) => ({ ...m, [k]: { ...cur, saving: true, error: "", saved: false } }));
+  // ✅ FALLBACKS so "Save" works even if user didn't type anything
+  const repsToSend = String(cur.reps || prescribedReps || "").trim();
 
-    try {
-      await postLogSet({
-        date: workoutDate,
-        routineId,
-        sessionId,
-        sessionName,
-        exerciseId: exId,
-        exerciseName: exName,
-        setNumber: setIndex,
-        prescribedReps,
-        prescribedWeight,
-        actualReps: cur.reps,
-        actualWeight: cur.weight,
-      });
+  // Only send weight if a number-like value exists (avoid sending units)
+  const weightCandidate = String(cur.weight || prescribedWeight || "").trim();
+  const weightToSend = weightCandidate && isFinite(Number(weightCandidate)) ? weightCandidate : "";
 
-      setLogInputs((m) => ({ ...m, [k]: { ...m[k], saving: false, saved: true, error: "" } }));
+  setLogInputs((m) => ({ ...m, [k]: { ...cur, saving: true, error: "", saved: false } }));
 
-      const data = await fetchBootstrap(import.meta.env.VITE_ROUTINE_ID as any);
-      if (data?.success) setBoot(data);
-    } catch (e: any) {
-      setLogInputs((m) => ({
-        ...m,
-        [k]: { ...m[k], saving: false, saved: false, error: String(e?.message || e) },
-      }));
-    }
+  try {
+    await postLogSet({
+      date: workoutDate,
+      routineId,
+      sessionId,
+      sessionName,
+      exerciseId: exId,
+      exerciseName: exName,
+      setNumber: setIndex,
+      prescribedReps: String(prescribedReps || "").trim(),
+      prescribedWeight: String(prescribedWeight || "").trim(), // keep numeric-only
+      actualReps: repsToSend,
+      actualWeight: weightToSend,
+    });
+
+    setLogInputs((m) => ({ ...m, [k]: { ...m[k], saving: false, saved: true, error: "" } }));
+
+    const data = await fetchBootstrap(import.meta.env.VITE_ROUTINE_ID as any);
+    if (data?.success) setBoot(data);
+  } catch (e: any) {
+    setLogInputs((m) => ({
+      ...m,
+      [k]: { ...m[k], saving: false, saved: false, error: String(e?.message || e) },
+    }));
   }
-
-  async function saveOneRM(exId: string) {
-    const n = Number(oneRMInput);
-    if (!isFinite(n) || n <= 0) {
-      setOneRMError("Enter a valid number for 1RM.");
-      setOneRMSaved(false);
-      return;
-    }
-
-    setOneRMSaving(true);
-    setOneRMError("");
-    setOneRMSaved(false);
-
-    try {
-      await postUpdateOneRM({ exerciseId: exId, oneRM: n, unit: currentUnit });
-      setOneRMSaved(true);
-
-      const data = await fetchBootstrap(import.meta.env.VITE_ROUTINE_ID as any);
-      if (data?.success) setBoot(data);
-    } catch (e: any) {
-      setOneRMError(String(e?.message || e));
-    } finally {
-      setOneRMSaving(false);
-    }
-  }
+}
+// =======================
+// SAVEANYSET REPLACEMENT END
+// =======================
 
   /* =========================================================
      ## LOADING / ERROR GATE ##
@@ -1333,16 +1344,27 @@ if (view === "muscle_balance") {
     }
 
     // planned weight numeric only (no unit suffix)
-    function plannedWeightNumber(s: any) {
-      const pct = toNumber(s?.PctTM);
-      if (pct == null || tm == null) return "";
+  // planned weight numeric only (no unit suffix)
+function plannedWeightNumber(s: any) {
+  const pct = toNumber(s?.PctTM);
+  if (pct == null || tm == null) return "";
 
-      const raw = (tm as number) * (pct as number);
-      const step = toNumber(s?.RoundTo);
-      const rounded = step != null && step > 0 ? Math.round(raw / step) * step : raw;
+  const raw = (tm as number) * (pct as number);
 
-      return String(fmtWeight(rounded)).trim();
-    }
+  // If your Set_Schemes sheet provides RoundTo (e.g. 2.5 or 5), respect it.
+  // Otherwise default to whole-number rounding (no decimals).
+  const step = toNumber(s?.RoundTo);
+
+  let rounded: number;
+  if (step != null && step > 0) {
+    rounded = Math.round(raw / step) * step;
+  } else {
+    rounded = Math.round(raw);
+  }
+
+  return String(fmtWeight(rounded)).trim();
+}
+
 
     // robust setIndex: supports multiple possible header names
     function getSetIndex(s: any, fallback: number) {
