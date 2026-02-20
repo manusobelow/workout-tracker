@@ -1,8 +1,12 @@
 /* =========================================================
    FILE: src/api.ts
    FULL FILE REPLACEMENT
+
    - Avoids CORS preflight (Content-Type: text/plain)
-   - Adds optional userId to logSet + updateOneRM
+   - Adds Workout Builder actions:
+     - createSessionWithExercises
+     - replaceSessionExercises
+     - deleteSession
    ========================================================= */
 
 export type ApiResult<T = any> =
@@ -29,12 +33,11 @@ function qs(params: Record<string, any>) {
 }
 
 function withActionUrl(action: string, extra: Record<string, any> = {}) {
-  // NOTE: include apiKey in query so Apps Script can read it from e.parameter.apiKey
   const query = qs({
     action,
     apiKey: API_KEY || undefined,
     ...extra,
-    _t: Date.now(), // cache-bust
+    _t: Date.now(),
   });
   return `${BASE_URL}${BASE_URL.includes("?") ? "&" : "?"}${query}`;
 }
@@ -42,9 +45,8 @@ function withActionUrl(action: string, extra: Record<string, any> = {}) {
 async function safeFetchJson(url: string, init?: RequestInit): Promise<any> {
   try {
     const res = await fetch(url, init);
-
-    // Some failures return HTML; handle gracefully
     const text = await res.text();
+
     let data: any = null;
     try {
       data = text ? JSON.parse(text) : null;
@@ -73,14 +75,11 @@ async function safeFetchJson(url: string, init?: RequestInit): Promise<any> {
  */
 async function postToGas(action: string, body: any): Promise<any> {
   const url = withActionUrl(action);
-
   const payload = JSON.stringify({ action, ...body });
 
   return safeFetchJson(url, {
     method: "POST",
-    headers: {
-      "Content-Type": "text/plain;charset=utf-8",
-    },
+    headers: { "Content-Type": "text/plain;charset=utf-8" },
     body: payload,
   });
 }
@@ -103,7 +102,7 @@ export async function fetchBootstrap(routineId?: string): Promise<ApiResult<any>
 }
 
 export async function postLogSet(input: {
-  userId?: string; // ✅ NEW (Em/Donya)
+  userId?: string;
   date: string;
   routineId: string;
   sessionId: string;
@@ -121,11 +120,55 @@ export async function postLogSet(input: {
 }
 
 export async function postUpdateOneRM(input: {
-  userId?: string; // ✅ NEW (Em/Donya)
+  userId?: string;
   exerciseId: string;
   oneRM: number;
   unit: string;
 }): Promise<ApiResult> {
   assertConfigured();
   return postToGas("updateOneRM", input);
+}
+
+/* =========================================================
+   ✅ WORKOUT BUILDER API
+   ========================================================= */
+
+export type BuilderExerciseRow = {
+  Order: number;
+  Block: string;
+  ExerciseID: string;
+  SchemeID: string;
+  Notes?: string;
+  SupersetID?: string;
+  SessionName?: string;
+};
+
+export async function postCreateSessionWithExercises(input: {
+  routineId: string;
+  sessionId: string;
+  sessionName: string;
+  notes?: string; // e.g. "BUILDER|BIAS=Upper"
+  exercises: BuilderExerciseRow[];
+}): Promise<ApiResult> {
+  assertConfigured();
+  return postToGas("createSessionWithExercises", input);
+}
+
+export async function postReplaceSessionExercises(input: {
+  routineId: string;
+  sessionId: string;
+  sessionName?: string;
+  notes?: string;
+  exercises: BuilderExerciseRow[];
+}): Promise<ApiResult> {
+  assertConfigured();
+  return postToGas("replaceSessionExercises", input);
+}
+
+export async function postDeleteSession(input: {
+  routineId: string;
+  sessionId: string;
+}): Promise<ApiResult> {
+  assertConfigured();
+  return postToGas("deleteSession", input);
 }

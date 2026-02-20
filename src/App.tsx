@@ -2,40 +2,36 @@
    FILE: src/App.tsx
    FULL FILE REPLACEMENT ✅
 
-   Home:
-     - Muscle Balance
-     - Routines
+   Adds Workout Builder / Generator:
+   - Deterministic (no randomness)
+   - Upper / Lower / Full Body bias
+   - Coverage enforcement
+   - Swap (Strict/Free)
+   - Finish -> writes to Routine_Sessions + Routine_Exercises
+   - Delete session (for GEN_ sessions)
+   - Re-customize (Edit in Builder for GEN_ sessions)
 
-   Muscle Balance:
-     ✅ Clickable SVG (front + back) with 6-stage color scale
-     ✅ Tap muscle → shows ONLY exercises for that muscle
-     ✅ Tap exercise → opens Exercise view
-
-   Exercise View:
-     ✅ LOGGING WORKS FOR ALL EXERCISES (Major + Accessory + Library-only)
-     ✅ Uses Exercise_Library.SchemeID for scheme display
-     ✅ Uses User_Maxes TM/1RM for planned weights
-     ✅ Every set row has Save button
-
-   Hard sets computed from Training_Log (boot.logs):
-     Primary = 1.0, Secondary = 0.5
-     Excludes WarmUp category
-     Window = last 3 logged training dates for current user
-
-   Target system:
-     ✅ Last 3 sessions ≈ “proxy week”
-     ✅ Goal per muscle over last 3 sessions:
-        - Minimum: 10
-        - Great: 20
+   Keeps existing:
+   - Muscle Balance
+   - Exercise Library
+   - Session + Exercise logging
    ========================================================= */
 
 import { useEffect, useMemo, useState } from "react";
 import "./App.css";
 import type { BootstrapResponse, RoutineExercise, RoutineSession } from "./types";
-import { authTest, fetchBootstrap, postLogSet, postUpdateOneRM } from "./api";
+import {
+  authTest,
+  fetchBootstrap,
+  postLogSet,
+  postUpdateOneRM,
+  postCreateSessionWithExercises,
+  postReplaceSessionExercises,
+  postDeleteSession,
+  type BuilderExerciseRow,
+} from "./api";
 import { buildIndexes, fmtWeight, isMajor, sortedSessionExercises, toNumber } from "./logic";
 import MuscleMap from "./components/MuscleMap";
-
 
 /* =========================================================
    ## TYPES ##
@@ -46,23 +42,44 @@ import MuscleMap from "./components/MuscleMap";
 // ==============================
 // START VIEW TYPES REPLACEMENT
 
-type View = "sessions" | "muscle_balance" | "library" | "session" | "exercise";
+type View = "sessions" | "muscle_balance" | "library" | "builder" | "session" | "exercise";
 
-// ✅ used by Exercise view "Back" logic
-type ExerciseBackTarget = "session" | "muscle_balance" | "library";
+type ExerciseBackTarget = "session" | "muscle_balance" | "library" | "builder";
 
-// ✅ Exercise Library browsing facets + stepper
 type LibraryFacetKey = "MovementPattern" | "PlaneOfMotion" | "PrimaryMuscle" | "SecondaryMuscle";
 type LibraryStep = "facet" | "value" | "exercise";
 
+// Workout Builder
+type BuilderBias = "Upper" | "Lower" | "Full Body";
+type BuilderMode = "create" | "edit"; // edit = recustomize existing GEN_ session
+
+type BuilderDraftItem = {
+  ExerciseID: string;
+  Name: string;
+  Category: string;
+  MovementPattern: string;
+  PlaneOfMotion: string;
+  PrimaryMuscle: string;
+  SecondaryMuscle: string;
+  LogMode: string;
+  SchemeID: string;
+  Notes: string;
+};
+
 function normalizeView(v: any): View {
-  if (v === "sessions" || v === "muscle_balance" || v === "library" || v === "session" || v === "exercise") return v;
+  if (
+    v === "sessions" ||
+    v === "muscle_balance" ||
+    v === "library" ||
+    v === "builder" ||
+    v === "session" ||
+    v === "exercise"
+  )
+    return v;
   return "sessions";
 }
 
 // END VIEW TYPES REPLACEMENT
-
-
 
 /* =========================================================
    ## DATE HELPERS ##
@@ -73,6 +90,16 @@ function todayLocalISO() {
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   const dd = String(d.getDate()).padStart(2, "0");
   return `${yyyy}-${mm}-${dd}`;
+}
+
+function nowSessionStamp() {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mi = String(d.getMinutes()).padStart(2, "0");
+  return `${yyyy}${mm}${dd}_${hh}${mi}`;
 }
 
 /* =========================================================
@@ -166,15 +193,27 @@ function normMuscleName(v: any): string {
     .replace(/\s+/g, " ");
 }
 
+function normStr(v: any): string {
+  return String(v || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
 function isWarmUpCategory(libRow: any): boolean {
   const cat = String(libRow?.Category || "").trim().toLowerCase();
   return cat === "warmup";
+}
+function isExcludedFromBuilder(libRow: any): boolean {
+  const cat = normStr(libRow?.Category);
+  if (cat === "warmup") return true;
+  if (cat === "mobility") return true;
+  return false;
 }
 
 /**
  * Timestamp stored in sheet as:
  * "yyyy-MM-dd h:mm a"
- * Example: "2026-01-20 2:35 PM"
  */
 function extractDateKeyFromTimestamp(ts: any): string {
   const s = String(ts || "").trim();
@@ -193,24 +232,61 @@ function parseYYYYMMDD(dateKey: string): number {
 
 /* =========================================================
    ## COLOR SCALE (6 STAGES)
-   Target: 10–20 hard sets per muscle across last 3 sessions
-   gray → blue → teal → green → orange → red
    ========================================================= */
 function colorForSets(sets: number): string {
   const v = Number(sets || 0);
+  if (v <= 0) return "#6B7280";
+  if (v < 4) return "#3B82F6";
+  if (v < 10) return "#14B8A6";
+  if (v < 16) return "#22C55E";
+  if (v <= 20) return "#F59E0B";
+  return "#EF4444";
+}
 
-  // 0        = gray
-  // 0–4      = blue
-  // 4–10     = teal
-  // 10–16    = green (minimum / good)
-  // 16–20    = orange (great)
-  // >20      = red
-  if (v <= 0) return "#6B7280"; // gray
-  if (v < 4) return "#3B82F6"; // blue
-  if (v < 10) return "#14B8A6"; // teal
-  if (v < 16) return "#22C55E"; // green
-  if (v <= 20) return "#F59E0B"; // orange
-  return "#EF4444"; // red
+/* =========================================================
+   ## BUILDER: CANONICAL MUSCLE LISTS ##
+   ========================================================= */
+const BIAS_LOWER = [
+  "Quads",
+  "Hamstrings",
+  "Glutes Max",
+  "Glute Med",
+  "Adductors",
+  "Calves",
+  "Tibialis Anterior",
+  "Hip Flexors",
+];
+
+const BIAS_UPPER = [
+  "Chest",
+  "Lats",
+  "Upper Back",
+  "Upper Traps",
+  "Mid Traps",
+  "Lower Traps",
+  "Rhomboids",
+  "Front Delts",
+  "Side Delts",
+  "Rear Delts",
+  "Rotator Cuff",
+  "Serratus",
+  "Biceps",
+  "Triceps",
+  "Forearms",
+  "Neck",
+];
+
+const BIAS_CORE = ["Abs", "Obliques", "Transverse Abdominis", "Spinal Erectors", "Quadratus Lumborum"];
+
+function biasSet(b: BuilderBias): Set<string> {
+  if (b === "Upper") return new Set([...BIAS_UPPER].map(normMuscleName));
+  if (b === "Lower") return new Set([...BIAS_LOWER].map(normMuscleName));
+  // Full Body: neutral, we still enforce coverage
+  return new Set<string>();
+}
+
+function isBuilderSessionId(sessionId: string) {
+  return String(sessionId || "").trim().toUpperCase().startsWith("GEN_");
 }
 
 /* =========================================================
@@ -229,10 +305,6 @@ export default function App() {
   const [workoutDate, setWorkoutDate] = useState<string>(todayLocalISO());
 
   const [doneMap, setDoneMap] = useState<Record<string, boolean>>({});
-// ## AUTOLOG STATE ##
-const [autoLogSaving, setAutoLogSaving] = useState<boolean>(false);
-const [autoLogError, setAutoLogError] = useState<string>("");
-// ## AUTOLOG STATE END ##
 
   const [logInputs, setLogInputs] = useState<
     Record<string, { reps: string; weight: string; saving?: boolean; error?: string; saved?: boolean }>
@@ -265,6 +337,23 @@ const [autoLogError, setAutoLogError] = useState<string>("");
 
   const [exerciseBackTarget, setExerciseBackTarget] = useState<ExerciseBackTarget>("session");
 
+  // =========================
+  // ✅ BUILDER STATE (HOOK-SAFE)
+  // =========================
+  const [builderBias, setBuilderBias] = useState<BuilderBias>("Upper");
+  const [builderMode, setBuilderMode] = useState<BuilderMode>("create");
+  const [builderEditingSessionId, setBuilderEditingSessionId] = useState<string>(""); // when editing GEN_
+  const [builderSessionName, setBuilderSessionName] = useState<string>("");
+  const [builderStrict, setBuilderStrict] = useState<boolean>(true);
+  const [builderPreferSamePrimary, setBuilderPreferSamePrimary] = useState<boolean>(true);
+
+  const [builderDraft, setBuilderDraft] = useState<BuilderDraftItem[]>([]);
+  const [builderErr, setBuilderErr] = useState<string>("");
+  const [builderSaving, setBuilderSaving] = useState<boolean>(false);
+
+  const [swapRowIndex, setSwapRowIndex] = useState<number>(-1);
+  const [swapFreeMode, setSwapFreeMode] = useState<boolean>(false); // independent toggle for swaps (helps recustomize)
+
   /* =========================================================
      ## SMALL HELPERS ##
      ========================================================= */
@@ -272,35 +361,32 @@ const [autoLogError, setAutoLogError] = useState<string>("");
     setLogInputs((m) => ({ ...m, [k]: { ...(m[k] || { reps: "", weight: "" }), [field]: v } }));
   }
 
-// =======================
-// NAV HELPERS START
-// =======================
-function goToExerciseIndex(nextIndex: number, maxLen: number) {
-  const safe = Math.max(0, Math.min(maxLen - 1, nextIndex));
-  setSelectedExerciseIndex(safe);
+  // =======================
+  // NAV HELPERS START
+  // =======================
+  function goToExerciseIndex(nextIndex: number, maxLen: number) {
+    const safe = Math.max(0, Math.min(maxLen - 1, nextIndex));
+    setSelectedExerciseIndex(safe);
 
-  // ✅ Critical: keep resolvedExerciseId in sync while in a session
-  const nextRow = sessionExercises[safe];
-  if (nextRow?.ExerciseID) {
-    setActiveExerciseId(String(nextRow.ExerciseID).trim());
-    setExerciseBackTarget("session");
-  } else {
-    // fallback: unpin
-    setActiveExerciseId("");
+    const nextRow = sessionExercises[safe];
+    if (nextRow?.ExerciseID) {
+      setActiveExerciseId(String(nextRow.ExerciseID).trim());
+      setExerciseBackTarget("session");
+    } else {
+      setActiveExerciseId("");
+    }
   }
-}
 
-function goPrevExercise(maxLen: number) {
-  goToExerciseIndex(selectedExerciseIndex - 1, maxLen);
-}
+  function goPrevExercise(maxLen: number) {
+    goToExerciseIndex(selectedExerciseIndex - 1, maxLen);
+  }
 
-function goNextExercise(maxLen: number) {
-  goToExerciseIndex(selectedExerciseIndex + 1, maxLen);
-}
-// =======================
-// NAV HELPERS END
-// =======================
-
+  function goNextExercise(maxLen: number) {
+    goToExerciseIndex(selectedExerciseIndex + 1, maxLen);
+  }
+  // =======================
+  // NAV HELPERS END
+  // =======================
 
   /* =========================================================
      ## BOOTSTRAP ##
@@ -539,7 +625,7 @@ function goNextExercise(maxLen: number) {
     return String(lib?.Notes || "");
   }
 
-    /* =========================================================
+  /* =========================================================
      ✅ OPEN EXERCISE ALWAYS HAS ExerciseID
      ========================================================= */
   function openExerciseFromMuscle(exId: string) {
@@ -569,7 +655,6 @@ function goNextExercise(maxLen: number) {
     setView("exercise");
   }
 
-  // ✅ Open exercise from Exercise Library filtered list
   function openExerciseFromLibrary(exId: string, list: string[], index: number) {
     const cleanId = String(exId || "").trim();
     if (!cleanId) return;
@@ -580,73 +665,536 @@ function goNextExercise(maxLen: number) {
     setActiveExerciseId(cleanId);
     setExerciseBackTarget("library");
 
-    // library context = not a routine session
     setSelectedSessionId("");
     setSelectedExerciseIndex(0);
 
     setView("exercise");
   }
 
-
   /* =========================================================
      ## BACKEND ACTIONS ##
-     ✅ LOG ANY SET (major/accessory + routine/library)
      ========================================================= */
   // =======================
-// SAVEANYSET REPLACEMENT START
-// =======================
-async function saveAnySet(args: {
-  exId: string;
-  exName: string;
-  sessionId: string;
-  sessionName: string;
-  setIndex: number;
-  prescribedReps?: string;
-  prescribedWeight?: string; // IMPORTANT: numeric-only string (no "lb" / "kg")
-}) {
-  const { exId, exName, sessionId, sessionName, setIndex, prescribedReps, prescribedWeight } = args;
+  // SAVEANYSET REPLACEMENT START
+  // =======================
+  async function saveAnySet(args: {
+    exId: string;
+    exName: string;
+    sessionId: string;
+    sessionName: string;
+    setIndex: number;
+    prescribedReps?: string;
+    prescribedWeight?: string; // numeric-only
+  }) {
+    const { exId, exName, sessionId, sessionName, setIndex, prescribedReps, prescribedWeight } = args;
 
-  const k = keyLog(workoutDate, sessionId, exId, setIndex);
-  const cur = logInputs[k] || { reps: "", weight: "" };
+    const k = keyLog(workoutDate, sessionId, exId, setIndex);
+    const cur = logInputs[k] || { reps: "", weight: "" };
 
-  // ✅ FALLBACKS so "Save" works even if user didn't type anything
-  const repsToSend = String(cur.reps || prescribedReps || "").trim();
+    const repsToSend = String(cur.reps || prescribedReps || "").trim();
 
-  // Only send weight if a number-like value exists (avoid sending units)
-  const weightCandidate = String(cur.weight || prescribedWeight || "").trim();
-  const weightToSend = weightCandidate && isFinite(Number(weightCandidate)) ? weightCandidate : "";
+    const weightCandidate = String(cur.weight || prescribedWeight || "").trim();
+    const weightToSend = weightCandidate && isFinite(Number(weightCandidate)) ? weightCandidate : "";
 
-  setLogInputs((m) => ({ ...m, [k]: { ...cur, saving: true, error: "", saved: false } }));
+    setLogInputs((m) => ({ ...m, [k]: { ...cur, saving: true, error: "", saved: false } }));
 
-  try {
-    await postLogSet({
-      date: workoutDate,
-      routineId,
-      sessionId,
-      sessionName,
-      exerciseId: exId,
-      exerciseName: exName,
-      setNumber: setIndex,
-      prescribedReps: String(prescribedReps || "").trim(),
-      prescribedWeight: String(prescribedWeight || "").trim(), // keep numeric-only
-      actualReps: repsToSend,
-      actualWeight: weightToSend,
-    });
+    try {
+      await postLogSet({
+        date: workoutDate,
+        routineId,
+        sessionId,
+        sessionName,
+        exerciseId: exId,
+        exerciseName: exName,
+        setNumber: setIndex,
+        prescribedReps: String(prescribedReps || "").trim(),
+        prescribedWeight: String(prescribedWeight || "").trim(),
+        actualReps: repsToSend,
+        actualWeight: weightToSend,
+      });
 
-    setLogInputs((m) => ({ ...m, [k]: { ...m[k], saving: false, saved: true, error: "" } }));
+      setLogInputs((m) => ({ ...m, [k]: { ...m[k], saving: false, saved: true, error: "" } }));
 
-    const data = await fetchBootstrap(import.meta.env.VITE_ROUTINE_ID as any);
-    if (data?.success) setBoot(data);
-  } catch (e: any) {
-    setLogInputs((m) => ({
-      ...m,
-      [k]: { ...m[k], saving: false, saved: false, error: String(e?.message || e) },
-    }));
+      const data = await fetchBootstrap(import.meta.env.VITE_ROUTINE_ID as any);
+      if (data?.success) setBoot(data);
+    } catch (e: any) {
+      setLogInputs((m) => ({
+        ...m,
+        [k]: { ...m[k], saving: false, saved: false, error: String(e?.message || e) },
+      }));
+    }
   }
-}
-// =======================
-// SAVEANYSET REPLACEMENT END
-// =======================
+  // =======================
+  // SAVEANYSET REPLACEMENT END
+  // =======================
+
+  async function saveOneRM(exId: string) {
+    const v = toNumber(oneRMInput);
+    if (v == null || v <= 0) return;
+    setOneRMSaving(true);
+    setOneRMError("");
+    setOneRMSaved(false);
+    try {
+      const res = await postUpdateOneRM({ userId, exerciseId: exId, oneRM: v, unit: currentUnit || "" });
+      if (!res?.success) throw new Error((res as any)?.error || "Failed to save 1RM");
+      setOneRMSaving(false);
+      setOneRMSaved(true);
+
+      const data = await fetchBootstrap(import.meta.env.VITE_ROUTINE_ID as any);
+      if (data?.success) setBoot(data);
+    } catch (e: any) {
+      setOneRMSaving(false);
+      setOneRMError(String(e?.message || e));
+    }
+  }
+
+  /* =========================================================
+     ## BUILDER: deterministic generator helpers ##
+     ========================================================= */
+
+  function libRowToDraft(exId: string): BuilderDraftItem | null {
+    const lib = libraryById[String(exId)] as any;
+    if (!lib) return null;
+
+    const schemeId = String(lib?.SchemeID || "").trim();
+    if (!schemeId) return null;
+    if (isExcludedFromBuilder(lib)) return null;
+
+    return {
+      ExerciseID: String(lib.ExerciseID || exId).trim(),
+      Name: String(lib.Name || exId).trim(),
+      Category: String(lib.Category || "").trim(),
+      MovementPattern: String(lib.MovementPattern || "").trim(),
+      PlaneOfMotion: String(lib.PlaneOfMotion || "").trim(),
+      PrimaryMuscle: String(lib.PrimaryMuscle || "").trim(),
+      SecondaryMuscle: String(lib.SecondaryMuscle || "").trim(),
+      LogMode: String(lib.LogMode || "").trim(),
+      SchemeID: schemeId,
+      Notes: String(lib.Notes || "").trim(),
+    };
+  }
+
+  function isMainLift(lib: BuilderDraftItem): boolean {
+    const lm = normStr(lib.LogMode);
+    const cat = normStr(lib.Category);
+    return lm === "main" || cat === "main";
+  }
+
+  function poolEligible(): BuilderDraftItem[] {
+    const out: BuilderDraftItem[] = [];
+    for (const id of libraryExerciseIds) {
+      const d = libRowToDraft(id);
+      if (d) out.push(d);
+    }
+    // stable deterministic ordering base
+    out.sort((a, b) => a.Name.localeCompare(b.Name) || a.ExerciseID.localeCompare(b.ExerciseID));
+    return out;
+  }
+
+  function scoreExercise(d: BuilderDraftItem, bias: BuilderBias): number {
+    if (bias === "Full Body") return 1;
+    const set = biasSet(bias);
+    const pm = normMuscleName(d.PrimaryMuscle);
+    const sm = normMuscleName(d.SecondaryMuscle);
+    let s = 1;
+    if (pm && set.has(pm)) s += 2;
+    if (sm && set.has(sm)) s += 1;
+    return s;
+  }
+
+  function movementIs(d: BuilderDraftItem, token: string): boolean {
+    return normStr(d.MovementPattern) === normStr(token);
+  }
+
+  function isPush(d: BuilderDraftItem): boolean {
+    const mp = normStr(d.MovementPattern);
+    return mp === normStr("Push Horizontal") || mp === normStr("Push Vertical");
+  }
+
+  function isPull(d: BuilderDraftItem): boolean {
+    const mp = normStr(d.MovementPattern);
+    return mp === normStr("Pull Horizontal") || mp === normStr("Pull Vertical");
+  }
+
+  function isSquatOrLunge(d: BuilderDraftItem): boolean {
+    const mp = normStr(d.MovementPattern);
+    return mp === normStr("Squat") || mp === normStr("Lunge");
+  }
+
+  function isHinge(d: BuilderDraftItem): boolean {
+    return normStr(d.MovementPattern) === normStr("Hinge");
+  }
+
+  function isCore(d: BuilderDraftItem): boolean {
+    return normStr(d.Category) === normStr("Core") || normStr(d.MovementPattern) === normStr("Core");
+  }
+
+  function isConditioning(d: BuilderDraftItem): boolean {
+    return normStr(d.Category) === normStr("Conditioning");
+  }
+
+  function isAccessory(d: BuilderDraftItem): boolean {
+    return normStr(d.Category) === normStr("Accessory");
+  }
+
+  function isShoulderScapSlot(d: BuilderDraftItem): boolean {
+    const pm = normMuscleName(d.PrimaryMuscle);
+    const sm = normMuscleName(d.SecondaryMuscle);
+    const targets = new Set(
+      ["Front Delts", "Side Delts", "Rear Delts", "Rotator Cuff", "Serratus"].map(normMuscleName)
+    );
+    return (pm && targets.has(pm)) || (sm && targets.has(sm));
+  }
+
+  function isLowerAccessorySlot(d: BuilderDraftItem): boolean {
+    const pm = normMuscleName(d.PrimaryMuscle);
+    const sm = normMuscleName(d.SecondaryMuscle);
+    const targets = new Set(["Calves", "Adductors", "Glute Med", "Tibialis Anterior", "Hip Flexors"].map(normMuscleName));
+    return (pm && targets.has(pm)) || (sm && targets.has(sm));
+  }
+
+  function selectBest(
+    candidates: BuilderDraftItem[],
+    bias: BuilderBias,
+    used: Set<string>,
+    mpCounts: Record<string, number>,
+    predicate: (d: BuilderDraftItem) => boolean
+  ): BuilderDraftItem | null {
+    const scored = candidates
+      .filter((d) => !used.has(d.ExerciseID))
+      .filter(predicate)
+      .filter((d) => {
+        const mp = normStr(d.MovementPattern);
+        const c = mpCounts[mp] || 0;
+        return c < 3; // do not allow 3+ of same MovementPattern
+      })
+      .map((d) => ({ d, s: scoreExercise(d, bias) }))
+      .sort((a, b) => b.s - a.s || a.d.Name.localeCompare(b.d.Name) || a.d.ExerciseID.localeCompare(b.d.ExerciseID));
+
+    return scored.length ? scored[0].d : null;
+  }
+
+  function pushPick(
+    picked: BuilderDraftItem[],
+    pick: BuilderDraftItem | null,
+    used: Set<string>,
+    mpCounts: Record<string, number>
+  ) {
+    if (!pick) return;
+    picked.push(pick);
+    used.add(pick.ExerciseID);
+    const mp = normStr(pick.MovementPattern);
+    mpCounts[mp] = (mpCounts[mp] || 0) + 1;
+  }
+
+  function generateWorkoutDraft(bias: BuilderBias): BuilderDraftItem[] {
+    const all = poolEligible();
+
+    const mains = all.filter((d) => isMainLift(d) && !isConditioning(d) && !isCore(d));
+    const acc = all.filter((d) => isAccessory(d) && !isConditioning(d) && !isCore(d));
+    const core = all.filter((d) => isCore(d));
+    const cond = all.filter((d) => isConditioning(d));
+
+    const used = new Set<string>();
+    const mpCounts: Record<string, number> = {};
+    const picked: BuilderDraftItem[] = [];
+
+    const wantConditioning = cond.length > 0; // optional, include if available
+
+    if (bias === "Upper") {
+      // 1 Main
+      pushPick(picked, selectBest(mains, bias, used, mpCounts, (d) => isPush(d) || isPull(d)), used, mpCounts);
+
+      // Accessories: ensure Push + Pull + Shoulder/Scap
+      pushPick(picked, selectBest(acc, bias, used, mpCounts, (d) => isPull(d)), used, mpCounts);
+      pushPick(picked, selectBest(acc, bias, used, mpCounts, (d) => isPush(d)), used, mpCounts);
+      pushPick(picked, selectBest(acc, bias, used, mpCounts, (d) => isShoulderScapSlot(d)), used, mpCounts);
+
+      // Fill remaining accessories to reach ~4 accessories total
+      while (picked.filter(isAccessory).length < 5) {
+        const next = selectBest(acc, bias, used, mpCounts, (d) => true);
+        if (!next) break;
+        pushPick(picked, next, used, mpCounts);
+      }
+
+      // Core
+      pushPick(picked, selectBest(core, bias, used, mpCounts, (d) => true), used, mpCounts);
+
+      // Optional Conditioning
+      if (wantConditioning) {
+        pushPick(picked, selectBest(cond, bias, used, mpCounts, (d) => true), used, mpCounts);
+      }
+    }
+
+    if (bias === "Lower") {
+      // 1 Main: Squat/Lunge preferred
+      pushPick(picked, selectBest(mains, bias, used, mpCounts, (d) => isSquatOrLunge(d)), used, mpCounts);
+
+      // Ensure hinge somewhere (main or accessory)
+      pushPick(picked, selectBest(acc, bias, used, mpCounts, (d) => isHinge(d)), used, mpCounts);
+
+      // Lower accessory slot
+      pushPick(picked, selectBest(acc, bias, used, mpCounts, (d) => isLowerAccessorySlot(d)), used, mpCounts);
+
+      // Fill additional accessories
+      while (picked.filter(isAccessory).length < 5) {
+        const next = selectBest(acc, bias, used, mpCounts, (d) => true);
+        if (!next) break;
+        pushPick(picked, next, used, mpCounts);
+      }
+
+      // Core
+      pushPick(picked, selectBest(core, bias, used, mpCounts, (d) => true), used, mpCounts);
+
+      // Optional Conditioning
+      if (wantConditioning) {
+        pushPick(picked, selectBest(cond, bias, used, mpCounts, (d) => true), used, mpCounts);
+      }
+    }
+
+    if (bias === "Full Body") {
+      // 2 Mains: squat/lunge + push/pull
+      pushPick(picked, selectBest(mains, bias, used, mpCounts, (d) => isSquatOrLunge(d)), used, mpCounts);
+      pushPick(picked, selectBest(mains, bias, used, mpCounts, (d) => isPush(d) || isPull(d)), used, mpCounts);
+
+      // Ensure hinge
+      pushPick(picked, selectBest(acc, bias, used, mpCounts, (d) => isHinge(d)), used, mpCounts);
+
+      // Ensure push + pull (if not already present in mains)
+      const hasPush = picked.some((d) => isPush(d));
+      const hasPull = picked.some((d) => isPull(d));
+
+      if (!hasPush) pushPick(picked, selectBest(acc, bias, used, mpCounts, (d) => isPush(d)), used, mpCounts);
+      if (!hasPull) pushPick(picked, selectBest(acc, bias, used, mpCounts, (d) => isPull(d)), used, mpCounts);
+
+      // Fill accessories to ~4 total accessories
+      while (picked.filter(isAccessory).length < 4) {
+        const next = selectBest(acc, bias, used, mpCounts, (d) => true);
+        if (!next) break;
+        pushPick(picked, next, used, mpCounts);
+      }
+
+      // Core
+      pushPick(picked, selectBest(core, bias, used, mpCounts, (d) => true), used, mpCounts);
+
+      // Optional Conditioning
+      if (wantConditioning) {
+        pushPick(picked, selectBest(cond, bias, used, mpCounts, (d) => true), used, mpCounts);
+      }
+    }
+
+    // final deterministic order:
+    // Main first, then Accessory, Core, Conditioning
+    const blockRank = (d: BuilderDraftItem) => {
+      if (isMainLift(d)) return 1;
+      if (isCore(d)) return 3;
+      if (isConditioning(d)) return 4;
+      return 2;
+    };
+
+    const out = picked.slice().sort((a, b) => blockRank(a) - blockRank(b) || a.Name.localeCompare(b.Name));
+    return out;
+  }
+
+  function draftToSheetRows(sessionName: string, draft: BuilderDraftItem[]): BuilderExerciseRow[] {
+    // Order 10,20,30...
+    const rows: BuilderExerciseRow[] = [];
+    for (let i = 0; i < draft.length; i++) {
+      const d = draft[i];
+      const order = (i + 1) * 10;
+
+      let block = "Accessory";
+      if (isMainLift(d)) block = "Main";
+      else if (normStr(d.Category) === normStr("Core")) block = "Core";
+      else if (normStr(d.Category) === normStr("Conditioning")) block = "Conditioning";
+
+      rows.push({
+        Order: order,
+        Block: block,
+        ExerciseID: d.ExerciseID,
+        SchemeID: d.SchemeID,
+        Notes: "",
+        SupersetID: "",
+        SessionName: sessionName,
+      });
+    }
+    return rows;
+  }
+
+  function resetBuilderToCreate() {
+    setBuilderMode("create");
+    setBuilderEditingSessionId("");
+    setBuilderSessionName("");
+    setBuilderDraft([]);
+    setBuilderErr("");
+    setBuilderSaving(false);
+    setSwapRowIndex(-1);
+    setSwapFreeMode(false);
+    setExerciseBackTarget("builder");
+  }
+
+  function openBuilderCreate() {
+    resetBuilderToCreate();
+    setView("builder");
+  }
+
+  function openBuilderEdit(sessionId: string) {
+    const sid = String(sessionId || "").trim();
+    if (!sid) return;
+
+    const sess = sessions.find((s) => String(s.SessionID || "").trim() === sid);
+    const sessName = String(sess?.SessionName || sid).trim();
+    const sessNotes = String(sess?.Notes || "").trim();
+
+    // Infer bias if stored
+    let bias: BuilderBias = "Upper";
+    const m = sessNotes.match(/BIAS=([^|]+)/i);
+    if (m && m[1]) {
+      const b = String(m[1]).trim().toLowerCase();
+      if (b === "upper") bias = "Upper";
+      if (b === "lower") bias = "Lower";
+      if (b === "full body" || b === "full") bias = "Full Body";
+    }
+
+    // Load Routine_Exercises rows for that session
+    const rows = sortedSessionExercises(allExercises, sid);
+
+    const draft: BuilderDraftItem[] = [];
+    for (const r of rows) {
+      const exId = String(r.ExerciseID || "").trim();
+      const d = libRowToDraft(exId);
+      if (d) draft.push(d);
+    }
+
+    setBuilderMode("edit");
+    setBuilderEditingSessionId(sid);
+    setBuilderBias(bias);
+    setBuilderSessionName(sessName);
+    setBuilderDraft(draft);
+    setBuilderErr("");
+    setBuilderSaving(false);
+    setSwapRowIndex(-1);
+    setSwapFreeMode(false);
+    setExerciseBackTarget("builder");
+
+    setView("builder");
+  }
+
+  function swapCandidatesForRow(target: BuilderDraftItem, currentDraft: BuilderDraftItem[]) {
+    const used = new Set(currentDraft.map((d) => d.ExerciseID));
+    const all = poolEligible().filter((d) => !used.has(d.ExerciseID));
+
+    if (!swapFreeMode) {
+      // Strict / Similar options
+      const targetCat = normStr(target.Category);
+      const targetMP = normStr(target.MovementPattern);
+      const targetPM = normMuscleName(target.PrimaryMuscle);
+
+      return all
+        .filter((d) => {
+          if (!builderStrict) return true;
+
+          const sameCat = normStr(d.Category) === targetCat;
+          const sameMP = normStr(d.MovementPattern) === targetMP;
+          if (!(sameCat || sameMP)) return false;
+
+          if (builderPreferSamePrimary) {
+            return normMuscleName(d.PrimaryMuscle) === targetPM;
+          }
+          return true;
+        })
+        .sort((a, b) => a.Name.localeCompare(b.Name));
+    }
+
+    // Free mode: show everything eligible (still no duplicates)
+    return all.sort((a, b) => a.Name.localeCompare(b.Name));
+  }
+
+  async function finishBuilder() {
+    setBuilderErr("");
+    if (!routineId) {
+      setBuilderErr("Missing routineId from bootstrap.");
+      return;
+    }
+    if (!builderDraft.length) {
+      setBuilderErr("Draft is empty. Generate a workout first.");
+      return;
+    }
+
+    setBuilderSaving(true);
+
+    const isEdit = builderMode === "edit" && !!builderEditingSessionId;
+
+    const sessionId = isEdit ? builderEditingSessionId : `GEN_${nowSessionStamp()}`;
+    const sessionName =
+      String(builderSessionName || "").trim() || (isEdit ? builderEditingSessionId : `Generated ${builderBias}`);
+
+    const notes = `BUILDER|BIAS=${builderBias}`;
+
+    const rows = draftToSheetRows(sessionName, builderDraft);
+
+    try {
+      if (isEdit) {
+        const res = await postReplaceSessionExercises({
+          routineId,
+          sessionId,
+          sessionName,
+          notes,
+          exercises: rows,
+        });
+        if (!res?.success) throw new Error((res as any)?.error || "Failed to update session");
+      } else {
+        const res = await postCreateSessionWithExercises({
+          routineId,
+          sessionId,
+          sessionName,
+          notes,
+          exercises: rows,
+        });
+        if (!res?.success) throw new Error((res as any)?.error || "Failed to create session");
+      }
+
+      const data = await fetchBootstrap(import.meta.env.VITE_ROUTINE_ID as any);
+      if (data?.success) setBoot(data);
+
+      // Open the created/edited session
+      setSelectedSessionId(sessionId);
+      setSelectedExerciseIndex(0);
+      setActiveExerciseId("");
+      setExerciseBackTarget("session");
+      setView("session");
+    } catch (e: any) {
+      setBuilderErr(String(e?.message || e));
+    } finally {
+      setBuilderSaving(false);
+    }
+  }
+
+  async function deleteBuilderSession(sessionId: string) {
+    const sid = String(sessionId || "").trim();
+    if (!sid) return;
+    if (!routineId) return;
+
+    setBuilderErr("");
+    setBuilderSaving(true);
+
+    try {
+      const res = await postDeleteSession({ routineId, sessionId: sid });
+      if (!res?.success) throw new Error((res as any)?.error || "Failed to delete session");
+
+      const data = await fetchBootstrap(import.meta.env.VITE_ROUTINE_ID as any);
+      if (data?.success) setBoot(data);
+
+      setSelectedSessionId("");
+      setSelectedExerciseIndex(0);
+      setActiveExerciseId("");
+      setView("sessions");
+    } catch (e: any) {
+      setBuilderErr(String(e?.message || e));
+    } finally {
+      setBuilderSaving(false);
+    }
+  }
 
   /* =========================================================
      ## LOADING / ERROR GATE ##
@@ -662,7 +1210,7 @@ async function saveAnySet(args: {
     );
   }
 
-   /* =========================================================
+  /* =========================================================
      ## VIEW: sessions (HOME) ##
      ========================================================= */
   if (view === "sessions") {
@@ -713,7 +1261,6 @@ async function saveAnySet(args: {
               <div className="bubbleSub muted">Tap muscles → see exercise options</div>
             </button>
 
-            {/* ✅ Exercise Library entry point */}
             <button
               className={`bubble bubble--main`.trim()}
               onClick={() => {
@@ -727,6 +1274,17 @@ async function saveAnySet(args: {
             >
               <div className="bubbleTitle">Exercise Library</div>
               <div className="bubbleSub muted">Browse by PrimaryMuscle / MovementPattern / PlaneOfMotion</div>
+            </button>
+
+            {/* ✅ NEW: Workout Builder */}
+            <button
+              className={`bubble bubble--main`.trim()}
+              onClick={() => {
+                openBuilderCreate();
+              }}
+            >
+              <div className="bubbleTitle">Workout Builder</div>
+              <div className="bubbleSub muted">Generate Upper / Lower / Full Body sessions</div>
             </button>
 
             {sessions.map((s) => (
@@ -751,223 +1309,456 @@ async function saveAnySet(args: {
     );
   }
 
-// ==============================
-// FILE: src/App.tsx
-// SECTION: VIEW: muscle_balance (FULL BLOCK REPLACEMENT)
-// ==============================
-// START MUSCLE_BALANCE VIEW REPLACEMENT
+  // ==============================
+  // VIEW: builder
+  // ==============================
+  if (view === "builder") {
+    const isEdit = builderMode === "edit" && !!builderEditingSessionId;
 
-if (view === "muscle_balance") {
-  const dateKeys = muscleBalance.dateKeys;
+    const canGenerate = libraryExerciseIds.length > 0;
 
-  function clickMuscle(m: string) {
-    setMbSelectedMuscle((cur) => (normMuscleName(cur) === normMuscleName(m) ? "" : m));
-  }
+    const draftSummary = (() => {
+      const mains = builderDraft.filter(isMainLift).length;
+      const acc = builderDraft.filter(isAccessory).length;
+      const core = builderDraft.filter(isCore).length;
+      const cond = builderDraft.filter(isConditioning).length;
+      return { mains, acc, core, cond, total: builderDraft.length };
+    })();
 
-  // Map SVG tokens (inkscape:label / id) -> your Exercise_Library muscle names
-  // (keep this small and expand as you add labels)
-  function mapTokenToMuscle(tokenRaw: string): string {
-    const t = String(tokenRaw || "").trim();
-    const n = normMuscleName(t);
+    const swapTarget = swapRowIndex >= 0 ? builderDraft[swapRowIndex] : null;
+    const swapCandidates = swapTarget ? swapCandidatesForRow(swapTarget, builderDraft) : [];
 
-    const map: Record<string, string> = {
-      // common label -> library muscle name
-      "traps": "Upper Traps",
-      "upper traps": "Upper Traps",
-      "rear delts": "Rear Delts",
-      "rear deltoids": "Rear Delts",
-      "front delts": "Front Delts",
-      "front deltoids": "Front Delts",
-      "lats": "Lats",
-      "upper back": "Upper Back",
-      "hamstrings": "Hamstrings",
-      "glutes": "Glutes",
-      "quads": "Quads",
-      "calves": "Calves",
-      "chest": "Chest",
-      "biceps": "Biceps",
-      "triceps": "Triceps",
-      "forearms": "Forearms",
-      "adductors": "Adductors",
-      "hip flexors": "Hip Flexors",
-      "tibialis anterior": "Tibialis Anterior",
-      "spinal erectors": "Spinal erectors",
-      "rhomboids": "Rhomboids",
-      "scapulae": "Scapulae",
-      "teres major": "Teres Major",
-    };
-
-    // If we have a known mapping, use it.
-    if (map[n]) return map[n];
-
-    // Otherwise, just return the token itself (lets you use labels that already match library)
-    return t;
-  }
-
-  function handleMuscleToken(token: string) {
-    if (!token || token === "UNKNOWN") return;
-    const muscle = mapTokenToMuscle(token);
-    if (!muscle) return;
-    clickMuscle(muscle);
-  }
-
-  function colorForToken(token: string): string | null {
-    const muscle = mapTokenToMuscle(token);
-    if (!muscle) return null;
-    const sets = setsForMuscle(muscle);
-    return colorForSets(sets);
-  }
-
-  function isSelectedToken(token: string): boolean {
-    const muscle = mapTokenToMuscle(token);
-    if (!muscle) return false;
-    return normMuscleName(muscle) === normMuscleName(mbSelectedMuscle);
-  }
-
-  const selected = String(mbSelectedMuscle || "").trim();
-  const selectedSets = selected ? setsForMuscle(selected) : 0;
-
-  return (
-    <div className="app">
-      <div className="page">
-        <div className="headerRow">
-          <button className="pill" onClick={() => setView("sessions")}>
-            ← Home
-          </button>
-          <div className="titleSmall">Muscle Balance</div>
-        </div>
-
-        <div className="noteBox" style={{ marginTop: 10 }}>
-          <div style={{ fontWeight: 900, marginBottom: 6 }}>Target</div>
-          <div className="muted small">
-            Aim for <b>10–20 hard sets per muscle</b> across your last <b>3 sessions</b>.
-            <br />
-            Primary = 1.0 • Secondary = 0.5 • WarmUp excluded
-            <br />
-            <div style={{ marginTop: 8 }}>
-              <b>Colors:</b> gray=0 • blue=0–4 • teal=4–10 • green=10–16 • orange=16–20 • red=20+
-            </div>
-          </div>
-        </div>
-
-        <div className="noteBox" style={{ marginTop: 10 }}>
-          <div className="muted small">
-            User: <b>{userId || "—"}</b>
-            <br />
-            Dates: {dateKeys.length ? dateKeys.join(", ") : "No log dates found yet"}
-          </div>
-        </div>
-
-        <div className="block" style={{ marginTop: 12 }}>
-          <div className="blockTitle">Tap a muscle</div>
-
-          <div style={{ display: "flex", gap: 10 }}>
-            <div style={{ flex: 1 }}>
-              <div className="muted small" style={{ marginBottom: 6, fontWeight: 900 }}>
-                Front
-              </div>
-              <div style={{ borderRadius: 14, background: "rgba(255,255,255,0.04)", padding: 8 }}>
-                <MuscleMap
-                  side="front"
-                  onMuscleClick={handleMuscleToken}
-                  getColorForToken={colorForToken}
-                  isTokenSelected={isSelectedToken}
-                />
-              </div>
-            </div>
-
-            <div style={{ flex: 1 }}>
-              <div className="muted small" style={{ marginBottom: 6, fontWeight: 900 }}>
-                Back
-              </div>
-              <div style={{ borderRadius: 14, background: "rgba(255,255,255,0.04)", padding: 8 }}>
-                <MuscleMap
-                  side="back"
-                  onMuscleClick={handleMuscleToken}
-                  getColorForToken={colorForToken}
-                  isTokenSelected={isSelectedToken}
-                />
-              </div>
-            </div>
+    return (
+      <div className="app">
+        <div className="page">
+          <div className="headerRow">
+            <button
+              className="pill"
+              onClick={() => {
+                // Back to home
+                setView("sessions");
+              }}
+            >
+              ← Home
+            </button>
+            <div className="titleSmall">{isEdit ? "Workout Builder (Edit)" : "Workout Builder"}</div>
           </div>
 
-          {!selected ? (
+          {builderErr ? (
+            <div className="error" style={{ marginTop: 10 }}>
+              {builderErr}
+            </div>
+          ) : null}
+
+          <div className="block" style={{ marginTop: 12 }}>
+            <div className="blockTitle">1) Choose bias</div>
+
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10 }}>
+              {(["Upper", "Lower", "Full Body"] as BuilderBias[]).map((b) => (
+                <button
+                  key={b}
+                  className={`pill ${builderBias === b ? "pillDone" : ""}`}
+                  onClick={() => setBuilderBias(b)}
+                >
+                  {b}
+                </button>
+              ))}
+            </div>
+
             <div className="muted small" style={{ marginTop: 10 }}>
-              Tap any muscle on the body map to see exercises for that muscle.
+              Bias affects scoring. Coverage rules prevent duplicates and enforce Squat/Hinge/Push/Pull/Core requirements.
+            </div>
+          </div>
+
+          <div className="block" style={{ marginTop: 12 }}>
+            <div className="blockTitle">2) Generate</div>
+
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center", marginTop: 10 }}>
+              <button
+                className="pill"
+                disabled={!canGenerate}
+                onClick={() => {
+                  setBuilderErr("");
+                  const draft = generateWorkoutDraft(builderBias);
+                  setBuilderDraft(draft);
+                  setSwapRowIndex(-1);
+                }}
+              >
+                Build workout
+              </button>
+
+              <button
+                className="pill"
+                disabled={!builderDraft.length}
+                onClick={() => {
+                  setBuilderDraft([]);
+                  setSwapRowIndex(-1);
+                }}
+              >
+                Clear
+              </button>
+
+              <div className="muted small">
+                Draft: {draftSummary.total} (Main {draftSummary.mains}, Accessory {draftSummary.acc}, Core {draftSummary.core}
+                {draftSummary.cond ? `, Conditioning ${draftSummary.cond}` : ""})
+              </div>
+            </div>
+
+            {!canGenerate ? <div className="error small" style={{ marginTop: 10 }}>Exercise_Library not loaded.</div> : null}
+          </div>
+
+          <div className="block" style={{ marginTop: 12 }}>
+            <div className="blockTitle">3) Customize</div>
+
+            <div className="muted small" style={{ marginTop: 6 }}>
+              Swap defaults to “similar” options. Toggle Free mode if you want to reshape the workout completely.
+            </div>
+
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 10 }}>
+              <button className={`pill ${builderStrict ? "pillDone" : ""}`} onClick={() => setBuilderStrict((v) => !v)}>
+                Strict mode
+              </button>
+              <button
+                className={`pill ${builderPreferSamePrimary ? "pillDone" : ""}`}
+                onClick={() => setBuilderPreferSamePrimary((v) => !v)}
+                disabled={!builderStrict}
+              >
+                Prefer same PrimaryMuscle
+              </button>
+              <button className={`pill ${swapFreeMode ? "pillDone" : ""}`} onClick={() => setSwapFreeMode((v) => !v)}>
+                Free swap mode
+              </button>
+            </div>
+
+            {!builderDraft.length ? (
+              <div className="muted small" style={{ marginTop: 10 }}>
+                Generate a workout first.
+              </div>
+            ) : (
+              <div className="stack" style={{ marginTop: 12 }}>
+                {builderDraft.map((d, idx) => (
+                  <div key={`${d.ExerciseID}-${idx}`} className="block" style={{ marginTop: 0 }}>
+                    <div className="bubbleRow" style={{ justifyContent: "space-between" }}>
+                      <div>
+                        <div style={{ fontWeight: 900 }}>{d.Name}</div>
+                        <div className="muted small">
+                          {d.Category || "—"} • {d.MovementPattern || "—"} • {d.PrimaryMuscle || "—"}
+                          {d.SecondaryMuscle ? ` / ${d.SecondaryMuscle}` : ""}
+                        </div>
+                      </div>
+
+                      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                        <button className="pill small" onClick={() => setSwapRowIndex(idx)}>
+                          Swap
+                        </button>
+                        <button
+                          className="pill small"
+                          onClick={() => {
+                            setBuilderDraft((cur) => cur.filter((_, i) => i !== idx));
+                            if (swapRowIndex === idx) setSwapRowIndex(-1);
+                          }}
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {swapTarget ? (
+            <div className="block" style={{ marginTop: 12 }}>
+              <div className="blockTitle">Swap: {swapTarget.Name}</div>
+              <div className="muted small" style={{ marginBottom: 10 }}>
+                Showing {swapCandidates.length} candidates {swapFreeMode ? "(Free)" : "(Filtered)"}
+              </div>
+
+              {!swapCandidates.length ? (
+                <div className="muted small">No candidates found.</div>
+              ) : (
+                <div className="stack">
+                  {swapCandidates.slice(0, 60).map((c) => (
+                    <button
+                      key={`SWAP-${c.ExerciseID}`}
+                      className={`bubble bubble--main`.trim()}
+                      onClick={() => {
+                        setBuilderDraft((cur) => {
+                          const next = cur.slice();
+                          next[swapRowIndex] = c;
+                          return next;
+                        });
+                        setSwapRowIndex(-1);
+                      }}
+                    >
+                      <div className="bubbleTitle">{c.Name}</div>
+                      <div className="bubbleSub muted">
+                        {c.Category || "—"} • {c.MovementPattern || "—"} • {c.PrimaryMuscle || "—"}
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              <button className="pill" style={{ marginTop: 12 }} onClick={() => setSwapRowIndex(-1)}>
+                Close swap
+              </button>
+            </div>
+          ) : null}
+
+          <div className="block" style={{ marginTop: 12 }}>
+            <div className="blockTitle">4) Finish</div>
+
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center", marginTop: 10 }}>
+              <input
+                className="miniInput"
+                style={{ minWidth: 220 }}
+                placeholder={isEdit ? "Session name (optional)" : "Session name (optional)"}
+                value={builderSessionName}
+                onChange={(e) => setBuilderSessionName(e.target.value)}
+              />
+
+              <button className="pill" disabled={builderSaving || !builderDraft.length} onClick={finishBuilder}>
+                {builderSaving ? "Saving…" : isEdit ? "Save changes" : "Finish (save session)"}
+              </button>
+            </div>
+
+            {isEdit ? (
+              <div className="muted small" style={{ marginTop: 10 }}>
+                Editing: <b>{builderEditingSessionId}</b>
+              </div>
+            ) : null}
+          </div>
+
+          {isEdit ? (
+            <div className="block" style={{ marginTop: 12 }}>
+              <div className="blockTitle">Danger</div>
+              <button
+                className="pill"
+                disabled={builderSaving}
+                onClick={() => {
+                  deleteBuilderSession(builderEditingSessionId);
+                }}
+              >
+                Delete this session
+              </button>
+              <div className="muted small" style={{ marginTop: 8 }}>
+                Deletes the Routine_Sessions row and all Routine_Exercises rows for this GEN_ session.
+              </div>
             </div>
           ) : null}
         </div>
+      </div>
+    );
+  }
 
-        {selected ? (
-          <div className="block" style={{ marginTop: 12 }}>
-            <div className="blockTitle">
-              {selected}{" "}
-              <span className="chip" style={{ marginLeft: 8, background: colorForSets(selectedSets) as any }}>
-                {selectedSets.toFixed(1)}
-              </span>
-            </div>
+  // ==============================
+  // VIEW: muscle_balance
+  // ==============================
+  if (view === "muscle_balance") {
+    const dateKeys = muscleBalance.dateKeys;
 
-            <div className="muted small" style={{ marginBottom: 10 }}>
-              Primary (+1.0) and Secondary (+0.5) exercises from Exercise_Library
-            </div>
+    function clickMuscle(m: string) {
+      setMbSelectedMuscle((cur) => (normMuscleName(cur) === normMuscleName(m) ? "" : m));
+    }
 
-            <div className="stack">
-              <div className="muted small" style={{ fontWeight: 900 }}>
-                Primary (+1.0)
+    function mapTokenToMuscle(tokenRaw: string): string {
+      const t = String(tokenRaw || "").trim();
+      const n = normMuscleName(t);
+
+      const map: Record<string, string> = {
+        traps: "Upper Traps",
+        "upper traps": "Upper Traps",
+        "rear delts": "Rear Delts",
+        "rear deltoids": "Rear Delts",
+        "front delts": "Front Delts",
+        "front deltoids": "Front Delts",
+        lats: "Lats",
+        "upper back": "Upper Back",
+        hamstrings: "Hamstrings",
+        glutes: "Glutes Max",
+        quads: "Quads",
+        calves: "Calves",
+        chest: "Chest",
+        biceps: "Biceps",
+        triceps: "Triceps",
+        forearms: "Forearms",
+        adductors: "Adductors",
+        "hip flexors": "Hip Flexors",
+        "tibialis anterior": "Tibialis Anterior",
+        "spinal erectors": "Spinal Erectors",
+        rhomboids: "Rhomboids",
+        scapulae: "Scapulae",
+        "teres major": "Teres Major",
+      };
+
+      if (map[n]) return map[n];
+      return t;
+    }
+
+    function handleMuscleToken(token: string) {
+      if (!token || token === "UNKNOWN") return;
+      const muscle = mapTokenToMuscle(token);
+      if (!muscle) return;
+      clickMuscle(muscle);
+    }
+
+    function colorForToken(token: string): string | null {
+      const muscle = mapTokenToMuscle(token);
+      if (!muscle) return null;
+      const sets = setsForMuscle(muscle);
+      return colorForSets(sets);
+    }
+
+    function isSelectedToken(token: string): boolean {
+      const muscle = mapTokenToMuscle(token);
+      if (!muscle) return false;
+      return normMuscleName(muscle) === normMuscleName(mbSelectedMuscle);
+    }
+
+    const selected = String(mbSelectedMuscle || "").trim();
+    const selectedSets = selected ? setsForMuscle(selected) : 0;
+
+    return (
+      <div className="app">
+        <div className="page">
+          <div className="headerRow">
+            <button className="pill" onClick={() => setView("sessions")}>
+              ← Home
+            </button>
+            <div className="titleSmall">Muscle Balance</div>
+          </div>
+
+          <div className="noteBox" style={{ marginTop: 10 }}>
+            <div style={{ fontWeight: 900, marginBottom: 6 }}>Target</div>
+            <div className="muted small">
+              Aim for <b>10–20 hard sets per muscle</b> across your last <b>3 sessions</b>.
+              <br />
+              Primary = 1.0 • Secondary = 0.5 • WarmUp excluded
+              <br />
+              <div style={{ marginTop: 8 }}>
+                <b>Colors:</b> gray=0 • blue=0–4 • teal=4–10 • green=10–16 • orange=16–20 • red=20+
               </div>
-
-              {!mbPrimaryExerciseIds.length ? (
-                <div className="muted small">No primary exercises for this muscle in Exercise_Library.</div>
-              ) : (
-                mbPrimaryExerciseIds
-                  .slice()
-                  .sort((a, b) => exerciseNameFor(a).localeCompare(exerciseNameFor(b)))
-                  .map((exId) => (
-                    <button
-                      key={`MBP-${exId}`}
-                      className={`bubble bubble--main`.trim()}
-                      onClick={() => openExerciseFromMuscle(exId)}
-                    >
-                      <div className="bubbleTitle">{exerciseNameFor(exId)}</div>
-                      {exerciseNotesFor(exId) ? <div className="bubbleSub muted">{exerciseNotesFor(exId)}</div> : null}
-                    </button>
-                  ))
-              )}
-
-              <div className="muted small" style={{ fontWeight: 900, marginTop: 10 }}>
-                Secondary (+0.5)
-              </div>
-
-              {!mbSecondaryExerciseIds.length ? (
-                <div className="muted small">No secondary exercises for this muscle in Exercise_Library.</div>
-              ) : (
-                mbSecondaryExerciseIds
-                  .slice()
-                  .sort((a, b) => exerciseNameFor(a).localeCompare(exerciseNameFor(b)))
-                  .map((exId) => (
-                    <button
-                      key={`MBS-${exId}`}
-                      className={`bubble bubble--main`.trim()}
-                      onClick={() => openExerciseFromMuscle(exId)}
-                    >
-                      <div className="bubbleTitle">{exerciseNameFor(exId)}</div>
-                      {exerciseNotesFor(exId) ? <div className="bubbleSub muted">{exerciseNotesFor(exId)}</div> : null}
-                    </button>
-                  ))
-              )}
-
-              <button className="pill" style={{ marginTop: 12 }} onClick={() => setMbSelectedMuscle("")}>
-                Clear selection
-              </button>
             </div>
           </div>
-        ) : null}
-      </div>
-    </div>
-  );
-}
 
-// END MUSCLE_BALANCE VIEW REPLACEMENT
+          <div className="noteBox" style={{ marginTop: 10 }}>
+            <div className="muted small">
+              User: <b>{userId || "—"}</b>
+              <br />
+              Dates: {dateKeys.length ? dateKeys.join(", ") : "No log dates found yet"}
+            </div>
+          </div>
+
+          <div className="block" style={{ marginTop: 12 }}>
+            <div className="blockTitle">Tap a muscle</div>
+
+            <div style={{ display: "flex", gap: 10 }}>
+              <div style={{ flex: 1 }}>
+                <div className="muted small" style={{ marginBottom: 6, fontWeight: 900 }}>
+                  Front
+                </div>
+                <div style={{ borderRadius: 14, background: "rgba(255,255,255,0.04)", padding: 8 }}>
+                  <MuscleMap
+                    side="front"
+                    onMuscleClick={handleMuscleToken}
+                    getColorForToken={colorForToken}
+                    isTokenSelected={isSelectedToken}
+                  />
+                </div>
+              </div>
+
+              <div style={{ flex: 1 }}>
+                <div className="muted small" style={{ marginBottom: 6, fontWeight: 900 }}>
+                  Back
+                </div>
+                <div style={{ borderRadius: 14, background: "rgba(255,255,255,0.04)", padding: 8 }}>
+                  <MuscleMap
+                    side="back"
+                    onMuscleClick={handleMuscleToken}
+                    getColorForToken={colorForToken}
+                    isTokenSelected={isSelectedToken}
+                  />
+                </div>
+              </div>
+            </div>
+
+            {!selected ? (
+              <div className="muted small" style={{ marginTop: 10 }}>
+                Tap any muscle on the body map to see exercises for that muscle.
+              </div>
+            ) : null}
+          </div>
+
+          {selected ? (
+            <div className="block" style={{ marginTop: 12 }}>
+              <div className="blockTitle">
+                {selected}{" "}
+                <span className="chip" style={{ marginLeft: 8, background: colorForSets(selectedSets) as any }}>
+                  {selectedSets.toFixed(1)}
+                </span>
+              </div>
+
+              <div className="muted small" style={{ marginBottom: 10 }}>
+                Primary (+1.0) and Secondary (+0.5) exercises from Exercise_Library
+              </div>
+
+              <div className="stack">
+                <div className="muted small" style={{ fontWeight: 900 }}>
+                  Primary (+1.0)
+                </div>
+
+                {!mbPrimaryExerciseIds.length ? (
+                  <div className="muted small">No primary exercises for this muscle in Exercise_Library.</div>
+                ) : (
+                  mbPrimaryExerciseIds
+                    .slice()
+                    .sort((a, b) => exerciseNameFor(a).localeCompare(exerciseNameFor(b)))
+                    .map((exId) => (
+                      <button
+                        key={`MBP-${exId}`}
+                        className={`bubble bubble--main`.trim()}
+                        onClick={() => openExerciseFromMuscle(exId)}
+                      >
+                        <div className="bubbleTitle">{exerciseNameFor(exId)}</div>
+                        {exerciseNotesFor(exId) ? <div className="bubbleSub muted">{exerciseNotesFor(exId)}</div> : null}
+                      </button>
+                    ))
+                )}
+
+                <div className="muted small" style={{ fontWeight: 900, marginTop: 10 }}>
+                  Secondary (+0.5)
+                </div>
+
+                {!mbSecondaryExerciseIds.length ? (
+                  <div className="muted small">No secondary exercises for this muscle in Exercise_Library.</div>
+                ) : (
+                  mbSecondaryExerciseIds
+                    .slice()
+                    .sort((a, b) => exerciseNameFor(a).localeCompare(exerciseNameFor(b)))
+                    .map((exId) => (
+                      <button
+                        key={`MBS-${exId}`}
+                        className={`bubble bubble--main`.trim()}
+                        onClick={() => openExerciseFromMuscle(exId)}
+                      >
+                        <div className="bubbleTitle">{exerciseNameFor(exId)}</div>
+                        {exerciseNotesFor(exId) ? <div className="bubbleSub muted">{exerciseNotesFor(exId)}</div> : null}
+                      </button>
+                    ))
+                )}
+
+                <button className="pill" style={{ marginTop: 12 }} onClick={() => setMbSelectedMuscle("")}>
+                  Clear selection
+                </button>
+              </div>
+            </div>
+          ) : null}
+        </div>
+      </div>
+    );
+  }
 
   /* =========================================================
      ## VIEW: library (Exercise Library browser) ##
@@ -1053,7 +1844,6 @@ if (view === "muscle_balance") {
                   setLibExerciseIndex(0);
                   return;
                 }
-                // exercise list
                 setLibStep("value");
                 setLibExerciseIds([]);
                 setLibExerciseIndex(0);
@@ -1101,7 +1891,6 @@ if (view === "muscle_balance") {
                         setLibFacetValue(v.label);
                         setLibStep("exercise");
 
-                        // precompute the list so Exercise view can Prev/Next through it
                         const list: string[] = [];
                         const target = normFacet(v.label);
 
@@ -1157,7 +1946,6 @@ if (view === "muscle_balance") {
     );
   }
 
-
   /* =========================================================
      ## VIEW: session ##
      ========================================================= */
@@ -1188,6 +1976,8 @@ if (view === "muscle_balance") {
     keys.sort((a, b) => order.indexOf(a) - order.indexOf(b));
     const blocks = keys.map((k) => ({ block: k, rows: by[k] }));
 
+    const canEditBuilder = isBuilderSessionId(String(currentSession.SessionID || "")) || normStr(currentSession.Notes).includes("builder");
+
     return (
       <div className="app">
         <div className="page">
@@ -1198,7 +1988,18 @@ if (view === "muscle_balance") {
             <div className="titleSmall">{currentSession.SessionName}</div>
           </div>
 
-          <div className="stack">
+          {canEditBuilder ? (
+            <div className="navRow" style={{ marginTop: 10 }}>
+              <button className="pill" onClick={() => openBuilderEdit(String(currentSession.SessionID || ""))}>
+                Edit in Builder
+              </button>
+              <button className="pill" onClick={() => deleteBuilderSession(String(currentSession.SessionID || ""))}>
+                Delete Session
+              </button>
+            </div>
+          ) : null}
+
+          <div className="stack" style={{ marginTop: 10 }}>
             {blocks.map(({ block, rows }) => (
               <div key={block} className="block">
                 <div className="blockTitle">{block}</div>
@@ -1250,41 +2051,49 @@ if (view === "muscle_balance") {
       </div>
     );
   }
-/* =========================================================
+
+  /* =========================================================
      ## VIEW: exercise (LOG EVERYTHING)
      ========================================================= */
   if (view === "exercise") {
     const exId = String(resolvedExerciseId || "").trim();
     const lib = exId ? ((libraryById[exId] as any) || null) : null;
 
+    const backBtn = (
+      <button
+        className="pill"
+        onClick={() => {
+          if (exerciseBackTarget === "library") {
+            setView("library");
+            return;
+          }
+          if (exerciseBackTarget === "muscle_balance") {
+            setView("muscle_balance");
+            return;
+          }
+          if (exerciseBackTarget === "builder") {
+            setView("builder");
+            return;
+          }
+          if (!selectedSessionId || !currentSession) {
+            setView("sessions");
+            return;
+          }
+          setView("session");
+        }}
+      >
+        ← Back
+      </button>
+    );
+
     if (!exId || !lib) {
       return (
         <div className="app">
           <div className="page">
-           <div className="headerRow">
-  <button
-    className="pill"
-    onClick={() => {
-      if (exerciseBackTarget === "library") {
-        setView("library");
-        return;
-      }
-      if (exerciseBackTarget === "muscle_balance") {
-        setView("muscle_balance");
-        return;
-      }
-      if (!selectedSessionId || !currentSession) {
-        setView("sessions");
-        return;
-      }
-      setView("session");
-    }}
-  >
-    ← Back
-  </button>
-  <div className="titleSmall">Exercise</div>
-</div>
-
+            <div className="headerRow">
+              {backBtn}
+              <div className="titleSmall">Exercise</div>
+            </div>
 
             <div className="error">
               Exercise not found in Exercise_Library.
@@ -1299,27 +2108,18 @@ if (view === "muscle_balance") {
 
     const name = String(lib?.Name || exId);
 
-    // if currentRow matches exId, we are in a Routine_Exercises session context
-    const inSession =
-      !!currentRow && String(currentRow.ExerciseID || "") === exId && !!currentRow.SessionID;
+    const inSession = !!currentRow && String(currentRow.ExerciseID || "") === exId && !!currentRow.SessionID;
 
-    // library-only fallback context
     const sessionIdForLogging = inSession ? String(currentRow?.SessionID || "") : "LIBRARY";
-    const sessionNameForLogging = inSession
-      ? String(currentRow?.SessionName || currentSession?.SessionName || "")
-      : "Exercise Library";
+    const sessionNameForLogging = inSession ? String(currentRow?.SessionName || currentSession?.SessionName || "") : "Exercise Library";
 
-    const blockLabel = String(
-      inSession ? (currentRow?.Block || lib?.Category || "") : (lib?.Category || "")
-    );
+    const blockLabel = String(inSession ? (currentRow?.Block || lib?.Category || "") : (lib?.Category || ""));
 
-    // Determine "Main" vs "Non-main"
     const isMain =
       String(blockLabel || "").toLowerCase() === "main" ||
       String(lib?.LogMode || "").toLowerCase() === "main" ||
       String(lib?.Category || "").toLowerCase() === "main";
 
-    // Scheme selection: prefer Routine_Exercises.SchemeID when in session
     const routineSchemeId = String(currentRow?.ExerciseID === exId ? currentRow?.SchemeID || "" : "");
     const schemeId = String(routineSchemeId || lib?.SchemeID || "");
 
@@ -1343,38 +2143,25 @@ if (view === "muscle_balance") {
       return String(rmin || rmax || "");
     }
 
-    // planned weight numeric only (no unit suffix)
-  // planned weight numeric only (no unit suffix)
-function plannedWeightNumber(s: any) {
-  const pct = toNumber(s?.PctTM);
-  if (pct == null || tm == null) return "";
+    function plannedWeightNumber(s: any) {
+      const pct = toNumber(s?.PctTM);
+      if (pct == null || tm == null) return "";
 
-  const raw = (tm as number) * (pct as number);
+      const raw = (tm as number) * (pct as number);
+      const step = toNumber(s?.RoundTo);
 
-  // If your Set_Schemes sheet provides RoundTo (e.g. 2.5 or 5), respect it.
-  // Otherwise default to whole-number rounding (no decimals).
-  const step = toNumber(s?.RoundTo);
+      let rounded: number;
+      if (step != null && step > 0) {
+        rounded = Math.round(raw / step) * step;
+      } else {
+        rounded = Math.round(raw);
+      }
 
-  let rounded: number;
-  if (step != null && step > 0) {
-    rounded = Math.round(raw / step) * step;
-  } else {
-    rounded = Math.round(raw);
-  }
+      return String(fmtWeight(rounded)).trim();
+    }
 
-  return String(fmtWeight(rounded)).trim();
-}
-
-
-    // robust setIndex: supports multiple possible header names
     function getSetIndex(s: any, fallback: number) {
-      const v =
-        s?.SetIndex ??
-        s?.SetNumber ??
-        s?.Set ??
-        s?.Index ??
-        s?.Order ??
-        fallback;
+      const v = s?.SetIndex ?? s?.SetNumber ?? s?.Set ?? s?.Index ?? s?.Order ?? fallback;
       const n = Number(v);
       return isFinite(n) && n > 0 ? n : fallback;
     }
@@ -1382,7 +2169,6 @@ function plannedWeightNumber(s: any) {
     const doneKey = keyDone(workoutDate, sessionIdForLogging, exId);
     const isDone = !!doneMap[doneKey];
 
-    // ✅ logs every set row for non-main, using either user-filled inputs OR planned defaults
     async function autoLogAllSets() {
       if (!schemeRows.length) return;
 
@@ -1396,11 +2182,9 @@ function plannedWeightNumber(s: any) {
         const k = keyLog(workoutDate, sessionIdForLogging, exId, setIndex);
         const cur = logInputs[k] || { reps: "", weight: "" };
 
-        // ✅ if user didn't type anything, use planned values automatically
         const actualReps = String(cur.reps || repsPlanned || "").trim();
         const actualWeight = isWeighted ? String(cur.weight || wtPlannedNum || "").trim() : "";
 
-        // show saving state
         setLogInputs((m) => ({ ...m, [k]: { ...cur, saving: true, error: "", saved: false } }));
 
         try {
@@ -1413,10 +2197,9 @@ function plannedWeightNumber(s: any) {
             exerciseName: name,
             setNumber: setIndex,
             prescribedReps: repsPlanned,
-            prescribedWeight: wtPlannedNum, // numeric only
+            prescribedWeight: wtPlannedNum,
             actualReps: actualReps,
             actualWeight: actualWeight,
-            notes: "AUTO_DONE",
           });
 
           setLogInputs((m) => ({ ...m, [k]: { ...m[k], saving: false, saved: true, error: "" } }));
@@ -1438,30 +2221,10 @@ function plannedWeightNumber(s: any) {
     return (
       <div className="app">
         <div className="page">
-         <div className="headerRow">
-  <button
-    className="pill"
-    onClick={() => {
-      if (exerciseBackTarget === "library") {
-        setView("library");
-        return;
-      }
-      if (exerciseBackTarget === "muscle_balance") {
-        setView("muscle_balance");
-        return;
-      }
-      if (!selectedSessionId || !currentSession) {
-        setView("sessions");
-        return;
-      }
-      setView("session");
-    }}
-  >
-    ← Back
-  </button>
-
-  <div className="titleSmall">{currentSession?.SessionName || "Exercise"}</div>
-</div>
+          <div className="headerRow">
+            {backBtn}
+            <div className="titleSmall">{currentSession?.SessionName || "Exercise"}</div>
+          </div>
 
           <div className="title">{name}</div>
           <div className="muted" style={{ marginBottom: 10 }}>
@@ -1489,7 +2252,6 @@ function plannedWeightNumber(s: any) {
                 const k = keyLog(workoutDate, sessionIdForLogging, exId, setIndex);
                 const cur = logInputs[k] || { reps: "", weight: "" };
 
-                // ✅ auto-populated defaults (but still editable)
                 const repsValue = cur.reps || repsPlanned || "";
                 const weightValue = cur.weight || wtPlannedNum || "";
 
@@ -1520,7 +2282,6 @@ function plannedWeightNumber(s: any) {
                         />
                       ) : null}
 
-                      {/* Manual save still possible (useful for Main) */}
                       <button
                         className="pill small"
                         disabled={!!cur.saving}
@@ -1532,7 +2293,7 @@ function plannedWeightNumber(s: any) {
                             sessionName: sessionNameForLogging,
                             setIndex,
                             prescribedReps: repsPlanned,
-                            prescribedWeight: wtPlannedNum, // numeric only
+                            prescribedWeight: wtPlannedNum,
                           })
                         }
                       >
@@ -1554,9 +2315,6 @@ function plannedWeightNumber(s: any) {
             </div>
           )}
 
-                  {/* ✅ Done / Auto-log button:
-              - NON-MAIN: primary workflow (logs all sets)
-              - MAIN: optional shortcut (still allows per-set Save) */}
           <div className="navRow">
             <button
               className={`pill ${isDone ? "pillDone" : ""}`}
@@ -1564,22 +2322,15 @@ function plannedWeightNumber(s: any) {
                 const next = !isDone;
                 setDoneMap((m) => ({ ...m, [doneKey]: next }));
 
-                // only auto-log when turning ON
                 if (next) {
                   await autoLogAllSets();
                 }
               }}
             >
-              {isDone
-                ? "✅ Done"
-                : isMain
-                ? "Auto log all sets (optional)"
-                : "Mark ✅ Done (auto log all sets)"}
+              {isDone ? "✅ Done" : isMain ? "Auto log all sets (optional)" : "Mark ✅ Done (auto log all sets)"}
             </button>
           </div>
 
-
-          {/* 1RM UI stays for weighted exercises */}
           {isWeighted ? (
             <div className="noteBox" style={{ marginTop: 12 }}>
               <div style={{ fontWeight: 900, marginBottom: 6 }}>1RM</div>
@@ -1595,12 +2346,7 @@ function plannedWeightNumber(s: any) {
                   value={oneRMEstWeight}
                   onChange={(e) => setOneRMEstWeight(e.target.value)}
                 />
-                <input
-                  className="miniInput"
-                  placeholder="reps"
-                  value={oneRMEstReps}
-                  onChange={(e) => setOneRMEstReps(e.target.value)}
-                />
+                <input className="miniInput" placeholder="reps" value={oneRMEstReps} onChange={(e) => setOneRMEstReps(e.target.value)} />
                 <span className="chip">Est: {estOneRM != null ? fmtWeight(estOneRM, unit) : "—"}</span>
               </div>
 
@@ -1618,12 +2364,7 @@ function plannedWeightNumber(s: any) {
                   Set 1RM = Est
                 </button>
 
-                <input
-                  className="miniInput"
-                  placeholder={`1RM (${unit})`}
-                  value={oneRMInput}
-                  onChange={(e) => setOneRMInput(e.target.value)}
-                />
+                <input className="miniInput" placeholder={`1RM (${unit})`} value={oneRMInput} onChange={(e) => setOneRMInput(e.target.value)} />
 
                 <button className="pill small" disabled={oneRMSaving || !exId} onClick={() => saveOneRM(exId)}>
                   {oneRMSaving ? "Saving…" : "Save 1RM"}
@@ -1640,7 +2381,6 @@ function plannedWeightNumber(s: any) {
             </div>
           ) : null}
 
-          {/* GIF */}
           {rawGif ? (
             <div className="gifWrap">
               <div className="muted small">Demo</div>
@@ -1666,11 +2406,7 @@ function plannedWeightNumber(s: any) {
               <button className="pill small" onClick={() => goPrevExercise(sessionExercises.length)} disabled={selectedExerciseIndex <= 0}>
                 ← Prev
               </button>
-              <button
-                className="pill small"
-                onClick={() => goNextExercise(sessionExercises.length)}
-                disabled={selectedExerciseIndex >= sessionExercises.length - 1}
-              >
+              <button className="pill small" onClick={() => goNextExercise(sessionExercises.length)} disabled={selectedExerciseIndex >= sessionExercises.length - 1}>
                 Next →
               </button>
             </div>
@@ -1679,10 +2415,6 @@ function plannedWeightNumber(s: any) {
       </div>
     );
   }
-  /* =========================================================
-     ## VIEW: exercise (LOG EVERYTHING) END ##
-     ========================================================= */
-
 
   /* =========================================================
      ## SAFETY FALLBACK ##
